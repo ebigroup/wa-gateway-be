@@ -1,3 +1,6 @@
-[
-  "f505316aba3e8e36"
-]
+{
+  "f505316aba3e8e36": {
+    "webhookUrl": "https://stg-api.hopesparepart.com"
+  }
+}
+

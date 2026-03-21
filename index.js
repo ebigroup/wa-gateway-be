@@ -1,6 +1,6 @@
 require("dotenv").config();
 const express = require("express");
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const QRCode = require("qrcode");
 const axios = require("axios");
 const fs = require("fs").promises;
@@ -8,16 +8,14 @@ const path = require("path");
 const { randomBytes } = require("crypto");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "20mb" })); // perlu limit besar untuk kirim image base64
 
 const PORT = process.env.PORT || 3000;
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
-// File yang menyimpan daftar sessionId yang perlu di-restore saat server boot
+// sessions.json menyimpan: { sessionId: { webhookUrl } }
 const SESSIONS_FILE = path.join(__dirname, "sessions.json");
 
-// sessionId -> { client, qr, status }
-// status: 'initializing' | 'qr_ready' | 'authenticated' | 'ready' | 'disconnected'
+// sessionId -> { client, qr, status, webhookUrl }
 const sessions = new Map();
 
 function generateSessionId() {
@@ -28,27 +26,30 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ── Simpan daftar sessionId ke disk ──────────────────────────────────────────
+// ── Simpan semua session (id + webhookUrl) ke disk ────────────────────────────
 async function persistSessions() {
-  const ids = [...sessions.keys()];
-  await fs.writeFile(SESSIONS_FILE, JSON.stringify(ids, null, 2));
+  const data = {};
+  for (const [id, s] of sessions.entries()) {
+    data[id] = { webhookUrl: s.webhookUrl || null };
+  }
+  await fs.writeFile(SESSIONS_FILE, JSON.stringify(data, null, 2));
 }
 
-// ── Load & restore semua session yang tersimpan saat server boot ──────────────
+// ── Restore session dari disk saat server boot ────────────────────────────────
 async function restoreSessions() {
-  let ids = [];
+  let data = {};
   try {
     const raw = await fs.readFile(SESSIONS_FILE, "utf-8");
-    ids = JSON.parse(raw);
+    data = JSON.parse(raw);
   } catch {
-    return; // file belum ada, tidak ada yang perlu di-restore
+    return; // belum ada file, skip
   }
 
-  if (!ids.length) return;
-  console.log(`Restoring ${ids.length} session(s):`, ids);
+  const entries = Object.entries(data);
+  if (!entries.length) return;
+  console.log(`Restoring ${entries.length} session(s):`, Object.keys(data));
 
-  for (const sessionId of ids) {
-    // Hanya restore jika folder auth-nya masih ada (belum dihapus)
+  for (const [sessionId, meta] of entries) {
     const authPath = path.join(
       __dirname,
       ".wwebjs_auth",
@@ -57,20 +58,19 @@ async function restoreSessions() {
     try {
       await fs.access(authPath);
     } catch {
-      console.log(`[${sessionId}] Auth folder not found, skipping restore`);
+      console.log(`[${sessionId}] Auth folder not found, skipping`);
       continue;
     }
 
     console.log(`[${sessionId}] Restoring...`);
-    // Jalankan di background, jangan blokir startup server
-    startSession(sessionId)
+    startSession(sessionId, meta.webhookUrl)
       .then(({ qr }) => {
         if (qr) {
           console.log(
-            `[${sessionId}] QR needed – fetch via GET /api/session/qr/${sessionId}`,
+            `[${sessionId}] QR needed → GET /api/session/qr/${sessionId}`,
           );
         } else {
-          console.log(`[${sessionId}] Restored successfully`);
+          console.log(`[${sessionId}] Restored`);
         }
       })
       .catch((err) => {
@@ -79,16 +79,13 @@ async function restoreSessions() {
   }
 }
 
-// ── Create and initialize a wwebjs client ─────────────────────────────────────
-function startSession(sessionId) {
+// ── Buat dan inisialisasi client WhatsApp ─────────────────────────────────────
+function startSession(sessionId, webhookUrl = null) {
   return new Promise((resolve, reject) => {
-    // LocalAuth saves session to ./.wwebjs_auth/session-<sessionId>
-    // so re-running the server won't need a new QR scan
     const client = new Client({
       authStrategy: new LocalAuth({ clientId: sessionId }),
       puppeteer: {
         headless: true,
-        // Use system Chromium if available (avoids missing .so library issues)
         executablePath: process.env.CHROME_BIN || undefined,
         args: [
           "--no-sandbox",
@@ -97,15 +94,19 @@ function startSession(sessionId) {
           "--disable-accelerated-2d-canvas",
           "--no-first-run",
           "--no-zygote",
-          "--single-process", // helps in constrained environments
+          "--single-process",
           "--disable-gpu",
         ],
       },
     });
 
-    sessions.set(sessionId, { client, qr: null, status: "initializing" });
+    sessions.set(sessionId, {
+      client,
+      qr: null,
+      status: "initializing",
+      webhookUrl,
+    });
 
-    // Resolve only once
     let resolved = false;
     const timeout = setTimeout(() => {
       if (!resolved) {
@@ -114,7 +115,6 @@ function startSession(sessionId) {
       }
     }, 60_000);
 
-    // ── QR received ──────────────────────────────────────────────────────────
     client.on("qr", async (qr) => {
       try {
         const qrImage = await QRCode.toDataURL(qr);
@@ -123,9 +123,7 @@ function startSession(sessionId) {
           session.qr = qrImage;
           session.status = "qr_ready";
         }
-        console.log(`[${sessionId}] QR ready – scan with WhatsApp`);
-
-        // Resolve on first QR so HTTP response returns immediately
+        console.log(`[${sessionId}] QR ready`);
         if (!resolved) {
           resolved = true;
           clearTimeout(timeout);
@@ -140,7 +138,6 @@ function startSession(sessionId) {
       }
     });
 
-    // ── Authenticated (QR was scanned) ───────────────────────────────────────
     client.on("authenticated", () => {
       const session = sessions.get(sessionId);
       if (session) {
@@ -150,13 +147,10 @@ function startSession(sessionId) {
       console.log(`[${sessionId}] Authenticated`);
     });
 
-    // ── Ready (fully loaded – also fires when resuming a saved session) ──────
     client.on("ready", () => {
       const session = sessions.get(sessionId);
       if (session) session.status = "ready";
       console.log(`[${sessionId}] Ready`);
-
-      // Resumed sessions skip QR and go straight here
       if (!resolved) {
         resolved = true;
         clearTimeout(timeout);
@@ -164,14 +158,12 @@ function startSession(sessionId) {
       }
     });
 
-    // ── Disconnected ─────────────────────────────────────────────────────────
     client.on("disconnected", (reason) => {
       console.log(`[${sessionId}] Disconnected:`, reason);
       const session = sessions.get(sessionId);
       if (session) session.status = "disconnected";
     });
 
-    // ── Auth failure ─────────────────────────────────────────────────────────
     client.on("auth_failure", (msg) => {
       console.error(`[${sessionId}] Auth failure:`, msg);
       const session = sessions.get(sessionId);
@@ -183,23 +175,48 @@ function startSession(sessionId) {
       }
     });
 
-    // ── Incoming messages → webhook ──────────────────────────────────────────
+    // ── Incoming messages → kirim ke webhook milik session ini ────────────────
     client.on("message", async (message) => {
-      if (!WEBHOOK_URL || message.fromMe) return;
+      if (message.fromMe) return;
+
+      const session = sessions.get(sessionId);
+      const url = session?.webhookUrl;
+      if (!url) return;
+
+      const payload = {
+        sessionId,
+        from: message.from,
+        text: message.body,
+        timestamp: message.timestamp,
+        messageId: message.id.id,
+        type: message.type, // 'chat' | 'image' | 'document' | dll
+        hasMedia: message.hasMedia,
+      };
+
+      // Jika pesan berisi media, sertakan base64-nya ke payload webhook
+      if (message.hasMedia) {
+        try {
+          const media = await message.downloadMedia();
+          payload.media = {
+            mimetype: media.mimetype,
+            filename: media.filename || null,
+            data: media.data, // base64
+          };
+        } catch (err) {
+          console.error(
+            `[${sessionId}] Failed to download media:`,
+            err.message,
+          );
+        }
+      }
+
       try {
-        await axios.post(WEBHOOK_URL, {
-          sessionId,
-          from: message.from,
-          text: message.body,
-          timestamp: message.timestamp,
-          messageId: message.id.id,
-        });
+        await axios.post(url, payload);
       } catch (err) {
         console.error(`[${sessionId}] Webhook failed:`, err.message);
       }
     });
 
-    // Launch Puppeteer + Chromium
     client.initialize().catch((err) => {
       if (!resolved) {
         resolved = true;
@@ -210,7 +227,7 @@ function startSession(sessionId) {
   });
 }
 
-// ── Delete a session ──────────────────────────────────────────────────────────
+// ── Hapus session ─────────────────────────────────────────────────────────────
 async function deleteSession(sessionId) {
   const session = sessions.get(sessionId);
   if (!session) return false;
@@ -219,7 +236,6 @@ async function deleteSession(sessionId) {
     await session.client.destroy();
   } catch (_) {}
 
-  // Remove saved auth folder
   const authPath = path.join(__dirname, ".wwebjs_auth", `session-${sessionId}`);
   try {
     await fs.rm(authPath, { recursive: true, force: true });
@@ -233,10 +249,9 @@ async function deleteSession(sessionId) {
 // ════════════════════════ ROUTES ═════════════════════════════════════════════
 
 // POST /api/session/start
-// Body (optional): { sessionId: "myname" }
-// Returns: { sessionId, qr: "<dataURL>" }  — qr is null if session resumed
+// Body: { sessionId?, webhookUrl? }
 app.post("/api/session/start", async (req, res) => {
-  let { sessionId } = req.body;
+  let { sessionId, webhookUrl = null } = req.body;
   if (!sessionId) sessionId = generateSessionId();
 
   if (sessions.has(sessionId)) {
@@ -244,8 +259,8 @@ app.post("/api/session/start", async (req, res) => {
   }
 
   try {
-    const result = await startSession(sessionId);
-    await persistSessions(); // simpan daftar session ke disk
+    const result = await startSession(sessionId, webhookUrl);
+    await persistSessions();
     res.json(result);
   } catch (err) {
     sessions.delete(sessionId);
@@ -253,8 +268,22 @@ app.post("/api/session/start", async (req, res) => {
   }
 });
 
+// PATCH /api/session/:sessionId/webhook
+// Ganti webhookUrl tanpa harus hapus dan buat ulang session
+// Body: { webhookUrl: "https://..." }  — kirim null untuk hapus webhook
+app.patch("/api/session/:sessionId/webhook", async (req, res) => {
+  const { sessionId } = req.params;
+  const { webhookUrl = null } = req.body;
+
+  const session = sessions.get(sessionId);
+  if (!session) return res.status(404).json({ error: "Session not found" });
+
+  session.webhookUrl = webhookUrl;
+  await persistSessions();
+  res.json({ success: true, webhookUrl });
+});
+
 // GET /api/session/qr/:sessionId
-// Fetch the latest QR image (refreshes if WhatsApp sends a new one before scan)
 app.get("/api/session/qr/:sessionId", (req, res) => {
   const session = sessions.get(req.params.sessionId);
   if (!session) return res.status(404).json({ error: "Session not found" });
@@ -273,14 +302,19 @@ app.get("/api/session/qr/:sessionId", (req, res) => {
 app.get("/api/session/status/:sessionId", (req, res) => {
   const session = sessions.get(req.params.sessionId);
   if (!session) return res.status(404).json({ error: "Session not found" });
-  res.json({ sessionId: req.params.sessionId, status: session.status });
+  res.json({
+    sessionId: req.params.sessionId,
+    status: session.status,
+    webhookUrl: session.webhookUrl || null,
+  });
 });
 
-// GET /api/sessions  — list all active sessions
+// GET /api/sessions
 app.get("/api/sessions", (_req, res) => {
   const list = [...sessions.entries()].map(([id, s]) => ({
     sessionId: id,
     status: s.status,
+    webhookUrl: s.webhookUrl || null,
   }));
   res.json(list);
 });
@@ -289,25 +323,44 @@ app.get("/api/sessions", (_req, res) => {
 app.delete("/api/session/:sessionId", async (req, res) => {
   const ok = await deleteSession(req.params.sessionId);
   if (!ok) return res.status(404).json({ error: "Session not found" });
-  await persistSessions(); // update daftar session di disk
+  await persistSessions();
   res.json({ success: true });
 });
 
 // POST /api/session/send
-// Body: { sessionId, to, text, delayMs?, typingDurationMs? }
-// "to" examples:
-//   personal : "6281234567890@c.us"
-//   group    : "120363xxxxxx@g.us"
+// Kirim pesan teks atau gambar
+//
+// Kirim teks:
+//   { sessionId, to, text, delayMs?, typingDurationMs? }
+//
+// Kirim gambar (salah satu dari imageUrl atau imageBase64):
+//   { sessionId, to, imageUrl: "https://...", caption? }
+//   { sessionId, to, imageBase64: "data:image/jpeg;base64,...", mimeType?, filename?, caption? }
 app.post("/api/session/send", async (req, res) => {
   const {
     sessionId,
     to,
+    // teks
     text,
+    // gambar via URL
+    imageUrl,
+    // gambar via base64 — bisa sertakan "data:image/jpeg;base64," atau tanpa prefix
+    imageBase64,
+    mimeType = "image/jpeg",
+    filename = "image.jpg",
+    caption = "",
+    // timing
     delayMs = 0,
     typingDurationMs = 2000,
   } = req.body;
-  if (!sessionId || !to || !text) {
-    return res.status(400).json({ error: "Missing: sessionId, to, text" });
+
+  if (!sessionId || !to) {
+    return res.status(400).json({ error: "Missing: sessionId, to" });
+  }
+  if (!text && !imageUrl && !imageBase64) {
+    return res
+      .status(400)
+      .json({ error: "Missing: text, imageUrl, atau imageBase64" });
   }
 
   const session = sessions.get(sessionId);
@@ -321,13 +374,34 @@ app.post("/api/session/send", async (req, res) => {
   try {
     if (delayMs > 0) await sleep(delayMs);
 
-    // Typing indicator
-    const chat = await session.client.getChatById(to);
-    await chat.sendStateTyping();
-    await sleep(typingDurationMs);
-    await chat.clearState();
+    let msg;
 
-    const msg = await session.client.sendMessage(to, text);
+    if (text) {
+      // ── Kirim teks dengan typing indicator ──────────────────────────────────
+      const chat = await session.client.getChatById(to);
+      await chat.sendStateTyping();
+      await sleep(typingDurationMs);
+      await chat.clearState();
+      msg = await session.client.sendMessage(to, text);
+    } else if (imageUrl) {
+      // ── Kirim gambar dari URL ────────────────────────────────────────────────
+      const media = await MessageMedia.fromUrl(imageUrl, { unsafeMime: true });
+      msg = await session.client.sendMessage(to, media, {
+        caption: caption || undefined,
+      });
+    } else if (imageBase64) {
+      // ── Kirim gambar dari base64 ─────────────────────────────────────────────
+      // Hapus prefix "data:image/jpeg;base64," jika ada
+      const base64Data = imageBase64.includes(",")
+        ? imageBase64.split(",")[1]
+        : imageBase64;
+
+      const media = new MessageMedia(mimeType, base64Data, filename);
+      msg = await session.client.sendMessage(to, media, {
+        caption: caption || undefined,
+      });
+    }
+
     res.json({ success: true, messageId: msg.id.id });
   } catch (err) {
     console.error(`[${sessionId}] Send error:`, err.message);
@@ -363,5 +437,5 @@ app.post("/api/session/read", async (req, res) => {
 
 app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
-  await restoreSessions(); // auto-reconnect semua session sebelumnya
+  await restoreSessions();
 });
