@@ -7,10 +7,20 @@ const fs = require("fs").promises;
 const path = require("path");
 const { randomBytes } = require("crypto");
 
+// Ack map untuk webhook status baca/kirim
+const ACK_STATUS = {
+  0: "error",
+  1: "pending",
+  2: "sent",
+  3: "delivered",
+  4: "read",
+  5: "played",
+};
+
 const app = express();
 app.use(express.json({ limit: "20mb" })); // perlu limit besar untuk kirim image base64
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3009;
 
 // sessions.json menyimpan: { sessionId: { webhookUrl } }
 const SESSIONS_FILE = path.join(__dirname, "sessions.json");
@@ -184,6 +194,7 @@ function startSession(sessionId, webhookUrl = null) {
       if (!url) return;
 
       const payload = {
+        event: "message_in",
         sessionId,
         from: message.from,
         text: message.body,
@@ -191,6 +202,7 @@ function startSession(sessionId, webhookUrl = null) {
         messageId: message.id.id,
         type: message.type, // 'chat' | 'image' | 'document' | dll
         hasMedia: message.hasMedia,
+        isReply: message.hasQuotedMsg || false,
       };
 
       // Jika pesan berisi media, sertakan base64-nya ke payload webhook
@@ -209,6 +221,93 @@ function startSession(sessionId, webhookUrl = null) {
           );
         }
       }
+
+      // Sertakan info pesan yang di-reply jika ada
+      if (message.hasQuotedMsg) {
+        try {
+          const quoted = await message.getQuotedMessage();
+          payload.quoted = {
+            messageId: quoted.id.id,
+            from: quoted.from,
+            text: quoted.body,
+            timestamp: quoted.timestamp,
+            type: quoted.type,
+          };
+        } catch (err) {
+          console.error(
+            `[${sessionId}] Failed to fetch quoted message:`,
+            err.message,
+          );
+        }
+      }
+
+      try {
+        await axios.post(url, payload);
+      } catch (err) {
+        console.error(`[${sessionId}] Webhook failed:`, err.message);
+      }
+    });
+
+    // Pesan keluar (dikirim via API) → kirim ke webhook juga
+    client.on("message_create", async (message) => {
+      if (!message.fromMe) return;
+
+      const session = sessions.get(sessionId);
+      const url = session?.webhookUrl;
+      if (!url) return;
+
+      const payload = {
+        event: "message_out",
+        sessionId,
+        to: message.to,
+        from: message.from,
+        text: message.body,
+        timestamp: message.timestamp,
+        messageId: message.id.id,
+        type: message.type,
+        hasMedia: message.hasMedia,
+      };
+
+      if (message.hasMedia) {
+        try {
+          const media = await message.downloadMedia();
+          payload.media = {
+            mimetype: media.mimetype,
+            filename: media.filename || null,
+            data: media.data, // base64
+          };
+        } catch (err) {
+          console.error(
+            `[${sessionId}] Failed to download outgoing media:`,
+            err.message,
+          );
+        }
+      }
+
+      try {
+        await axios.post(url, payload);
+      } catch (err) {
+        console.error(`[${sessionId}] Webhook failed:`, err.message);
+      }
+    });
+
+    // Status pesan (sent/delivered/read/played) → webhook
+    client.on("message_ack", async (message, ack) => {
+      const session = sessions.get(sessionId);
+      const url = session?.webhookUrl;
+      if (!url) return;
+
+      const payload = {
+        event: "message_ack",
+        sessionId,
+        messageId: message.id.id,
+        fromMe: message.fromMe,
+        from: message.from,
+        to: message.to,
+        ack,
+        status: ACK_STATUS[ack] || "unknown",
+        timestamp: message.timestamp,
+      };
 
       try {
         await axios.post(url, payload);

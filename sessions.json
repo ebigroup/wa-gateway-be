@@ -1,6 +1,5 @@
 {
   "f505316aba3e8e36": {
-    "webhookUrl": "https://stg-api.hopesparepart.com"
+    "webhookUrl": "http://localhost:8080/api/webhook/whatsapp"
   }
 }
-
