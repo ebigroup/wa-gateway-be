@@ -359,7 +359,8 @@ async function fetchChats(sessionId = null, id_toko = null) {
     conn
       .query(
         `SELECT wc.*,
-                COALESCE(wc.display_name, c.nama_customer) AS display_name
+                COALESCE(wc.display_name, c.nama_customer) AS display_name,
+                c.nama_customer
          FROM whatsapp_chats wc
          LEFT JOIN customer c ON c.no_hp_customer = wc.phone
          WHERE (? IS NULL OR wc.session_id = ?)
@@ -438,15 +439,25 @@ function matchIdToko(clientIdToko, rowIdToko) {
   return rowIdToko === clientIdToko;
 }
 
+function enrichChatForBroadcast(chat) {
+  if (!chat) return chat;
+  return {
+    ...chat,
+    display_name: chat.display_name ?? chat.nama_customer ?? chat.displayName,
+    labels: chat.labels || [],
+  };
+}
+
 function broadcastChatUpdate(chat) {
   if (!wss) return;
+  const enriched = enrichChatForBroadcast(chat);
   for (const ws of wss.clients) {
     if (
       ws.readyState === WebSocket.OPEN &&
-      (ws.meta?.sessionId === null || ws.meta?.sessionId === chat.session_id) &&
-      matchIdToko(ws.meta?.id_toko, chat.id_toko)
+      (ws.meta?.sessionId === null || ws.meta?.sessionId === enriched.session_id) &&
+      matchIdToko(ws.meta?.id_toko, enriched.id_toko)
     ) {
-      ws.send(JSON.stringify({ type: "chat_updated", chat }));
+      ws.send(JSON.stringify({ type: "chat_updated", chat: enriched }));
     }
   }
 }
