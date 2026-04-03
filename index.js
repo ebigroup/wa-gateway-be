@@ -10,6 +10,14 @@ const path = require("path");
 const { randomBytes } = require("crypto");
 const mysql = require("mysql2/promise");
 
+// Jangan biarkan proses mati karena error yang bisa kita log
+process.on("unhandledRejection", (reason, p) => {
+  console.error("Unhandled Rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught Exception:", err);
+});
+
 // Ack map untuk webhook status baca/kirim
 const ACK_STATUS = {
   0: "error",
@@ -194,6 +202,19 @@ async function resolveStoreBySession(sessionId) {
   return result;
 }
 
+async function updateSessionStatusMeta(sessionId, status) {
+  const store = await resolveStoreBySession(sessionId);
+  if (!store?.id_toko) return;
+  await withDb((conn) =>
+    conn.query(
+      `UPDATE toko_meta
+         SET meta_value = ?, updated_at = NOW()
+       WHERE toko_id = ? AND meta_key = 'chat_session_status'`,
+      [status, store.id_toko],
+    ),
+  );
+}
+
 async function upsertChatAndMessage({
   sessionId,
   phone,
@@ -334,7 +355,7 @@ async function updateMessageStatus(externalId, status) {
 }
 
 async function fetchChats(sessionId = null, id_toko = null) {
-  return withDb((conn) =>
+  const rows = await withDb((conn) =>
     conn
       .query(
         `SELECT wc.*,
@@ -348,6 +369,39 @@ async function fetchChats(sessionId = null, id_toko = null) {
       )
       .then(([rows]) => rows),
   );
+
+  if (!rows.length) return rows;
+
+  const chatIds = rows.map((r) => r.id);
+  const labelRows = await withDb((conn) =>
+    conn
+      .query(
+        `SELECT cl.chat_id,
+                cl.label_id,
+                l.name,
+                l.color
+         FROM whatsapp_chat_labels cl
+         JOIN whatsapp_labels l ON l.id = cl.label_id
+         WHERE cl.chat_id IN (${chatIds.map(() => "?").join(",")})`,
+        chatIds,
+      )
+      .then(([r]) => r),
+  );
+
+  const labelMap = new Map();
+  for (const lr of labelRows) {
+    if (!labelMap.has(lr.chat_id)) labelMap.set(lr.chat_id, []);
+    labelMap.get(lr.chat_id).push({
+      label_id: lr.label_id,
+      name: lr.name,
+      color: lr.color,
+    });
+  }
+
+  return rows.map((row) => ({
+    ...row,
+    labels: labelMap.get(row.id) || [],
+  }));
 }
 
 async function fetchMessages(chatId, limit = 50) {
@@ -602,12 +656,18 @@ function startSession(sessionId, webhookUrl = null) {
         session.qr = null;
       }
       console.log(`[${sessionId}] Authenticated`);
+      updateSessionStatusMeta(sessionId, "authenticated").catch((e) =>
+        console.error(`[${sessionId}] status meta error:`, e.message),
+      );
     });
 
     client.on("ready", () => {
       const session = sessions.get(sessionId);
       if (session) session.status = "ready";
       console.log(`[${sessionId}] Ready`);
+      updateSessionStatusMeta(sessionId, "ready").catch((e) =>
+        console.error(`[${sessionId}] status meta error:`, e.message),
+      );
       if (!resolved) {
         resolved = true;
         clearTimeout(timeout);
@@ -615,16 +675,26 @@ function startSession(sessionId, webhookUrl = null) {
       }
     });
 
+    client.on("error", (err) => {
+      console.error(`[${sessionId}] Client error:`, err.message || err);
+    });
+
     client.on("disconnected", (reason) => {
       console.log(`[${sessionId}] Disconnected:`, reason);
       const session = sessions.get(sessionId);
       if (session) session.status = "disconnected";
+      updateSessionStatusMeta(sessionId, `disconnected:${reason || ""}`).catch(
+        (e) => console.error(`[${sessionId}] status meta error:`, e.message),
+      );
     });
 
     client.on("auth_failure", (msg) => {
       console.error(`[${sessionId}] Auth failure:`, msg);
       const session = sessions.get(sessionId);
       if (session) session.status = "disconnected";
+      updateSessionStatusMeta(sessionId, "auth_failure").catch((e) =>
+        console.error(`[${sessionId}] status meta error:`, e.message),
+      );
       if (!resolved) {
         resolved = true;
         clearTimeout(timeout);
