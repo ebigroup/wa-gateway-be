@@ -1,5 +1,7 @@
 require("dotenv").config();
 const express = require("express");
+const http = require("http");
+const WebSocket = require("ws");
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const QRCode = require("qrcode");
 const axios = require("axios");
@@ -27,6 +29,48 @@ const SESSIONS_FILE = path.join(__dirname, "sessions.json");
 
 // sessionId -> { client, qr, status, webhookUrl }
 const sessions = new Map();
+
+// WebSocket room state
+const rooms = new Map(); // roomName -> Set<ws>
+
+function broadcastRoom(room, message, excludeWs = null) {
+  const clients = rooms.get(room);
+  if (!clients) return;
+  const data = typeof message === "string" ? message : JSON.stringify(message);
+  for (const ws of clients) {
+    if (ws !== excludeWs && ws.readyState === WebSocket.OPEN) {
+      ws.send(data);
+    }
+  }
+}
+
+function joinRoom(ws, room, channel = null) {
+  const fullRoom = channel ? `${room}-${channel}` : room;
+  if (!rooms.has(fullRoom)) rooms.set(fullRoom, new Set());
+  rooms.get(fullRoom).add(ws);
+  if (!ws.rooms) ws.rooms = new Set();
+  ws.rooms.add(fullRoom);
+}
+
+function leaveRoom(ws, room, channel = null) {
+  const fullRoom = channel ? `${room}-${channel}` : room;
+  const roomClients = rooms.get(fullRoom);
+  if (!roomClients) return;
+  roomClients.delete(ws);
+  if (roomClients.size === 0) rooms.delete(fullRoom);
+  ws.rooms?.delete(fullRoom);
+}
+
+function leaveAllRooms(ws) {
+  if (!ws.rooms) return;
+  for (const room of ws.rooms) {
+    const roomClients = rooms.get(room);
+    if (!roomClients) continue;
+    roomClients.delete(ws);
+    if (roomClients.size === 0) rooms.delete(room);
+  }
+  ws.rooms.clear();
+}
 
 function generateSessionId() {
   return randomBytes(8).toString("hex");
@@ -620,7 +664,88 @@ app.post("/api/session/read", async (req, res) => {
   }
 });
 
-app.listen(PORT, async () => {
+const server = http.createServer(app);
+
+const wss = new WebSocket.Server({ noServer: true });
+
+wss.on("connection", (ws, req) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const qs = Object.fromEntries(url.searchParams.entries());
+
+  // Info awal (bisa diisi token auth sendiri, contohnya dari qs.auth)
+  ws.send(JSON.stringify({ event: "ws_connected", info: { query: qs } }));
+
+  ws.on("message", (raw) => {
+    let payload;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      ws.send(JSON.stringify({ event: "error", message: "Invalid JSON" }));
+      return;
+    }
+
+    const action = payload.action;
+    if (action === "join") {
+      if (!payload.room) {
+        ws.send(JSON.stringify({ event: "error", message: "room missing" }));
+        return;
+      }
+      const channel = payload.channel || null; // default null = room utama
+      joinRoom(ws, payload.room, channel);
+      ws.send(JSON.stringify({ event: "joined", room: payload.room, channel }));
+      return;
+    }
+
+    if (action === "leave") {
+      if (!payload.room) {
+        ws.send(JSON.stringify({ event: "error", message: "room missing" }));
+        return;
+      }
+      const channel = payload.channel || null;
+      leaveRoom(ws, payload.room, channel);
+      ws.send(JSON.stringify({ event: "left", room: payload.room, channel }));
+      return;
+    }
+
+    if (action === "message") {
+      if (!payload.room || !payload.data) {
+        ws.send(JSON.stringify({ event: "error", message: "room/data missing" }));
+        return;
+      }
+      const channel = payload.channel || null;
+      const fullRoom = channel ? `${payload.room}-${channel}` : payload.room;
+      broadcastRoom(fullRoom, { event: "message", room: payload.room, channel, data: payload.data }, ws);
+      return;
+    }
+
+    ws.send(JSON.stringify({ event: "error", message: "unsupported action" }));
+  });
+
+  ws.on("close", () => {
+    leaveAllRooms(ws);
+  });
+});
+
+server.on("upgrade", (req, socket, head) => {
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
+});
+
+app.post("/api/ws/room/:room/broadcast", (req, res) => {
+  const { room } = req.params;
+  const { event = "message", data, channel, chat_id } = req.body;
+  if (!room || data === undefined) {
+    return res.status(400).json({ error: "Missing: room, data" });
+  }
+  const fullRoom = channel ? `${room}-${channel}` : room;
+  const payload = { event, room, channel, data };
+  if (chat_id) payload.chat_id = chat_id;
+  broadcastRoom(fullRoom, payload);
+  res.json({ success: true, room, channel, event, data, chat_id });
+});
+
+server.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
   await restoreSessions();
 });
