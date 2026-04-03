@@ -133,6 +133,22 @@ function phoneFromJid(jid) {
   return digits || null;
 }
 
+function normalizePhone(number) {
+  if (!number) return null;
+  let n = number.replace(/\D/g, "");
+  if (!n) return null;
+  // Jika diawali 0, ubah ke 62 (Indonesia)
+  if (n.startsWith("0")) n = `62${n.slice(1)}`;
+  return n;
+}
+
+function canonicalJid(id) {
+  if (!id) return null;
+  if (id.endsWith("@lid")) return `${id.split("@")[0]}@c.us`;
+  if (id.endsWith("@c.us")) return id;
+  return id;
+}
+
 function logWebhookPayload(sessionId, payload) {
   // Hindari spam besar: ringkas field media.data
   const clone = { ...payload };
@@ -142,7 +158,7 @@ function logWebhookPayload(sessionId, payload) {
       dataLength: payload.media.data.length,
     };
   }
-  console.log(`[${sessionId}] Webhook payload:`, JSON.stringify(clone, null, 2));
+  //console.log(`[${sessionId}] Webhook payload:`, JSON.stringify(clone, null, 2));
 }
 
 function formatTimestamp(ts) {
@@ -182,6 +198,7 @@ async function upsertChatAndMessage({
   sessionId,
   phone,
   jid,
+  chatJid,
   text,
   direction, // 'in' | 'out'
   fromMe,
@@ -197,15 +214,39 @@ async function upsertChatAndMessage({
   const lastSnippet = text ? text.slice(0, 120) : null;
   return withDb(async (conn) => {
     let chatId;
-    const [existing] = await conn.query(
-      "SELECT id FROM whatsapp_chats WHERE session_id = ? AND jid = ? LIMIT 1",
+    // Cari berdasar phone dulu (karena sudah dinormalisasi), lalu jid
+    const [existingPhone] = await conn.query(
+      `SELECT id FROM whatsapp_chats
+         WHERE session_id = ? AND phone = ?
+         LIMIT 1`,
+      [sessionId, phone],
+    );
+    const [existingJid] = await conn.query(
+      `SELECT id FROM whatsapp_chats
+         WHERE session_id = ? AND jid = ?
+         LIMIT 1`,
       [sessionId, jid],
     );
-    if (existing.length) {
-      chatId = existing[0].id;
+    const [existingChatJid] = await conn.query(
+      `SELECT id FROM whatsapp_chats
+         WHERE session_id = ? AND jid = ?
+         LIMIT 1`,
+      [sessionId, chatJid],
+    );
+
+    if (existingPhone.length) {
+      chatId = existingPhone[0].id;
+    } else if (existingJid.length) {
+      chatId = existingJid[0].id;
+    } else if (existingChatJid.length) {
+      chatId = existingChatJid[0].id;
+    }
+
+    if (chatId) {
       await conn.query(
         `UPDATE whatsapp_chats
          SET phone = COALESCE(?, phone),
+             jid = COALESCE(?, jid),
              id_toko = COALESCE(?, id_toko),
              last_message_at = ?,
              last_message_snippet = ?,
@@ -214,6 +255,7 @@ async function upsertChatAndMessage({
          WHERE id = ?`,
         [
           phone || null,
+          chatJid || jid || null,
           id_toko,
           ts,
           lastSnippet,
@@ -231,7 +273,7 @@ async function upsertChatAndMessage({
           tenant_id,
           id_toko,
           phone || null,
-          jid,
+          chatJid || jid || null,
           sessionId,
           ts,
           lastSnippet,
@@ -278,22 +320,30 @@ async function upsertChatAndMessage({
 
 async function updateMessageStatus(externalId, status) {
   if (!externalId) return;
-  await withDb((conn) =>
-    conn.query(
+  return withDb(async (conn) => {
+    await conn.query(
       "UPDATE whatsapp_messages SET status = ?, updated_at = NOW() WHERE external_message_id = ?",
       [status, externalId],
-    ),
-  );
+    );
+    const [rows] = await conn.query(
+      "SELECT * FROM whatsapp_messages WHERE external_message_id = ? LIMIT 1",
+      [externalId],
+    );
+    return rows[0] || null;
+  });
 }
 
 async function fetchChats(sessionId = null, id_toko = null) {
   return withDb((conn) =>
     conn
       .query(
-        `SELECT * FROM whatsapp_chats
-         WHERE (? IS NULL OR session_id = ?)
-           AND (? IS NULL OR id_toko = ?)
-         ORDER BY updated_at DESC`,
+        `SELECT wc.*,
+                COALESCE(wc.display_name, c.nama_customer) AS display_name
+         FROM whatsapp_chats wc
+         LEFT JOIN customer c ON c.no_hp_customer = wc.phone
+         WHERE (? IS NULL OR wc.session_id = ?)
+           AND (? IS NULL OR wc.id_toko = ?)
+         ORDER BY wc.updated_at DESC`,
         [sessionId, sessionId, id_toko, id_toko],
       )
       .then(([rows]) => rows),
@@ -347,16 +397,58 @@ function broadcastChatUpdate(chat) {
   }
 }
 
-function broadcastMessage(message, chat) {
-  if (!wss) return;
+async function broadcastMessage(message, chat) {
+  if (!wss) return chat;
+
+  const watchers = [];
   for (const ws of wss.clients) {
     const watchChat =
       ws.readyState === WebSocket.OPEN &&
       ws.meta?.chatId &&
       Number(ws.meta.chatId) === Number(chat.id);
+    if (watchChat) watchers.push(ws);
+  }
+
+  // Jika ada yang sedang membuka chat ini dan pesan masuk, tandai sebagai dibaca
+  let currentChat = chat;
+  if (watchers.length && message.direction === "in") {
+    try {
+      const updatedChat = await markChatRead(chat.id);
+      if (updatedChat) currentChat = updatedChat;
+    } catch (err) {
+      console.error(`[${chat.session_id}] markRead on broadcast failed:`, err.message);
+    }
+  }
+
+  for (const ws of watchers) {
+    ws.send(
+      JSON.stringify({ type: "chat_detail_append", chatId: currentChat.id, message }),
+    );
+  }
+
+  // Update list view dengan unread terbaru jika berubah
+  if (message.direction === "in" && watchers.length) {
+    broadcastChatUpdate(currentChat);
+  }
+
+  return currentChat;
+}
+
+function broadcastMessageStatus(message) {
+  if (!wss || !message) return;
+  for (const ws of wss.clients) {
+    const watchChat =
+      ws.readyState === WebSocket.OPEN &&
+      ws.meta?.chatId &&
+      Number(ws.meta.chatId) === Number(message.chat_id);
     if (watchChat) {
       ws.send(
-        JSON.stringify({ type: "chat_detail_append", chatId: chat.id, message }),
+        JSON.stringify({
+          type: "message_status",
+          chatId: message.chat_id,
+          messageId: message.external_message_id,
+          status: message.status,
+        }),
       );
     }
   }
@@ -546,12 +638,26 @@ function startSession(sessionId, webhookUrl = null) {
 
       const session = sessions.get(sessionId);
       const url = session?.webhookUrl;
-      if (!url) return;
 
-      const from = await normalizeId(message, message.from);
+      const chat = await message.getChat().catch(() => null);
+      const contact = await message.getContact().catch(() => null);
+      const contactJid = canonicalJid(contact?.id?._serialized || null);
+      const chatJid = canonicalJid(chat?.id?._serialized || null);
+      const from =
+        contactJid ||
+        chatJid ||
+        canonicalJid(message.id?.remote) ||
+        canonicalJid(message.from) ||
+        (await normalizeId(message, message.from));
       // Abaikan grup/status
       if (!from || !from.endsWith("@c.us")) return;
-      const phone = phoneFromJid(from);
+      const phone = normalizePhone(
+        contact?.id?.user || chat?.id?.user || phoneFromJid(from),
+      );
+
+      console.log(
+        `[${sessionId}] in debug: from=${from}, rawFrom=${message.from}, contact=${contact?.id?._serialized}, chatId=${chat?.id?._serialized}, chatUser=${chat?.id?.user}, msg.id.remote=${message.id?.remote}`,
+      );
 
       const payload = {
         event: "message_in",
@@ -607,14 +713,14 @@ function startSession(sessionId, webhookUrl = null) {
       }
 
       try {
-        const jid = from;
         const store = await resolveStoreBySession(sessionId);
         const tenant_id = store?.tenant_id ?? DEFAULT_TENANT_ID;
         const id_toko = store?.id_toko ?? DEFAULT_ID_TOKO;
         const { chat, message: savedMessage } = await upsertChatAndMessage({
           sessionId,
           phone,
-          jid,
+          jid: from,
+          chatJid,
           text: message.body,
           direction: "in",
           fromMe: false,
@@ -626,15 +732,15 @@ function startSession(sessionId, webhookUrl = null) {
           quotedText: payload.quoted?.text || null,
           quotedExternalId: payload.quoted?.messageId || null,
         });
-        broadcastChatUpdate(chat);
-        broadcastMessage(savedMessage, chat);
+        const updatedChat = await broadcastMessage(savedMessage, chat);
+        broadcastChatUpdate(updatedChat || chat);
       } catch (err) {
         console.error(`[${sessionId}] DB persist error:`, err.message);
       }
 
       try {
         logWebhookPayload(sessionId, payload);
-        await axios.post(url, payload);
+        if (url) await axios.post(url, payload);
       } catch (err) {
         console.error(`[${sessionId}] Webhook failed:`, err.message);
       }
@@ -646,13 +752,45 @@ function startSession(sessionId, webhookUrl = null) {
 
       const session = sessions.get(sessionId);
       const url = session?.webhookUrl;
-      if (!url) return;
 
-      const to = await normalizeId(message, message.to);
-      const from = await normalizeId(message, message.from);
+      const chat = await message.getChat().catch(() => null);
+      const contact = await message.getContact().catch(() => null);
+      const peerContact = await chat?.getContact?.().catch(() => null);
+      const selfJid =
+        session.client?.info?.wid?._serialized ||
+        (session.client?.info?.wid?.user
+          ? `${session.client.info.wid.user}@c.us`
+          : null);
+      const rawPeerCandidate =
+        peerContact?.id?._serialized ||
+        message.id?.remote ||
+        contact?.id?._serialized ||
+        message.to ||
+        chat?.id?._serialized ||
+        message.from;
+
+      const to =
+        canonicalJid(rawPeerCandidate) ||
+        (await normalizeId(message, rawPeerCandidate));
+      const from =
+        selfJid ||
+        canonicalJid(message.from) ||
+        (await normalizeId(message, message.from));
       // Abaikan grup/status
       if (!to || !to.endsWith("@c.us")) return;
-      const phone = phoneFromJid(to);
+      const phone = normalizePhone(
+        phoneFromJid(to) ||
+          peerContact?.id?.user ||
+          contact?.id?.user ||
+          (rawPeerCandidate || "").split("@")[0] ||
+          chat?.id?.user ||
+          null,
+      );
+
+      // Debug mapping for outbound (helps ensure we use correct peer JID)
+      console.log(
+        `[${sessionId}] out debug: to=${to}, rawPeer=${rawPeerCandidate}, chatId=${chat?.id?._serialized}, chatUser=${chat?.id?.user}, contact=${contact?.id?._serialized}, peerContact=${peerContact?.id?._serialized}, msg.to=${message.to}, msg.from=${message.from}, msg.id.remote=${message.id?.remote}, self=${selfJid}`,
+      );
 
       const payload = {
         event: "message_out",
@@ -660,9 +798,9 @@ function startSession(sessionId, webhookUrl = null) {
         jid: to,
         phone,
         to,
-        rawTo: message.to,
+        rawTo: rawPeerCandidate,
         from,
-        rawFrom: message.from,
+        rawFrom: selfJid || message.from,
         text: message.body,
         timestamp: message.timestamp,
         messageId: message.id.id,
@@ -694,6 +832,7 @@ function startSession(sessionId, webhookUrl = null) {
           sessionId,
           phone,
           jid: to,
+          chatJid: to,
           text: message.body,
           direction: "out",
           fromMe: true,
@@ -703,15 +842,15 @@ function startSession(sessionId, webhookUrl = null) {
           id_toko,
           tenant_id,
         });
-        broadcastChatUpdate(chat);
-        broadcastMessage(savedMessage, chat);
+        const updatedChat = await broadcastMessage(savedMessage, chat);
+        broadcastChatUpdate(updatedChat || chat);
       } catch (err) {
         console.error(`[${sessionId}] DB persist error:`, err.message);
       }
 
       try {
         logWebhookPayload(sessionId, payload);
-        await axios.post(url, payload);
+        if (url) await axios.post(url, payload);
       } catch (err) {
         console.error(`[${sessionId}] Webhook failed:`, err.message);
       }
@@ -721,12 +860,14 @@ function startSession(sessionId, webhookUrl = null) {
     client.on("message_ack", async (message, ack) => {
       const session = sessions.get(sessionId);
       const url = session?.webhookUrl;
-      if (!url) return;
 
-      const from = await normalizeId(message, message.from);
-      const to = await normalizeId(message, message.to);
+      const from = canonicalJid(message.from) || (await normalizeId(message, message.from));
+      const to =
+        canonicalJid(message.to) ||
+        canonicalJid(message.id?.remote) ||
+        (await normalizeId(message, message.to || message.id?.remote || message.from));
+      const phone = normalizePhone(phoneFromJid(to) || message.id?.remote?.split("@")[0] || message.to?.split("@")[0]);
       if (!to || !to.endsWith("@c.us")) return;
-      const phone = phoneFromJid(to);
 
       const payload = {
         event: "message_ack",
@@ -745,14 +886,18 @@ function startSession(sessionId, webhookUrl = null) {
       };
 
       try {
-        await updateMessageStatus(message.id.id, ACK_STATUS[ack] || "unknown");
+        const updatedMsg = await updateMessageStatus(
+          message.id.id,
+          ACK_STATUS[ack] || "unknown",
+        );
+        broadcastMessageStatus(updatedMsg);
       } catch (err) {
         console.error(`[${sessionId}] DB ack update error:`, err.message);
       }
 
       try {
         logWebhookPayload(sessionId, payload);
-        await axios.post(url, payload);
+        if (url) await axios.post(url, payload);
       } catch (err) {
         console.error(`[${sessionId}] Webhook failed:`, err.message);
       }
