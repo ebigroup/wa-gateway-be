@@ -8,6 +8,7 @@ const axios = require("axios");
 const fs = require("fs").promises;
 const path = require("path");
 const { randomBytes } = require("crypto");
+const mysql = require("mysql2/promise");
 
 // Ack map untuk webhook status baca/kirim
 const ACK_STATUS = {
@@ -23,6 +24,16 @@ const app = express();
 app.use(express.json({ limit: "20mb" })); // perlu limit besar untuk kirim image base64
 
 const PORT = process.env.PORT || 3009;
+const DB_HOST = process.env.DB_HOST || "153.92.15.39";
+const DB_NAME = process.env.DB_NAME || "u623463806_hope_stg";
+const DB_USER = process.env.DB_USER || "u623463806_admin";
+const DB_PASS = process.env.DB_PASS || "AsikAsikJos!23";
+const DB_PORT = Number(process.env.DB_PORT || 3306);
+const DEFAULT_TENANT_ID = Number(process.env.DEFAULT_TENANT_ID || 1);
+const DEFAULT_ID_TOKO =
+  process.env.DEFAULT_ID_TOKO === undefined
+    ? null
+    : Number(process.env.DEFAULT_ID_TOKO);
 
 // sessions.json menyimpan: { sessionId: { webhookUrl } }
 const SESSIONS_FILE = path.join(__dirname, "sessions.json");
@@ -30,8 +41,20 @@ const SESSIONS_FILE = path.join(__dirname, "sessions.json");
 // sessionId -> { client, qr, status, webhookUrl }
 const sessions = new Map();
 
+// MySQL pool
+const db = mysql.createPool({
+  host: DB_HOST,
+  user: DB_USER,
+  password: DB_PASS,
+  database: DB_NAME,
+  port: DB_PORT,
+  waitForConnections: true,
+  connectionLimit: 10,
+});
+
 // WebSocket room state
 const rooms = new Map(); // roomName -> Set<ws>
+let wss = null;
 
 function broadcastRoom(room, message, excludeWs = null) {
   const clients = rooms.get(room);
@@ -103,6 +126,13 @@ async function normalizeId(message, id) {
   return id;
 }
 
+function phoneFromJid(jid) {
+  if (!jid) return null;
+  const user = jid.split("@")[0];
+  const digits = user.replace(/\D/g, "");
+  return digits || null;
+}
+
 function logWebhookPayload(sessionId, payload) {
   // Hindari spam besar: ringkas field media.data
   const clone = { ...payload };
@@ -113,6 +143,252 @@ function logWebhookPayload(sessionId, payload) {
     };
   }
   console.log(`[${sessionId}] Webhook payload:`, JSON.stringify(clone, null, 2));
+}
+
+function formatTimestamp(ts) {
+  if (!ts) return null;
+  const ms = ts < 2_000_000_000 ? ts * 1000 : ts;
+  return new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+}
+
+async function withDb(fn) {
+  const conn = await db.getConnection();
+  try {
+    return await fn(conn);
+  } finally {
+    conn.release();
+  }
+}
+
+const storeCache = new Map(); // sessionId -> { id_toko, tenant_id }
+
+async function resolveStoreBySession(sessionId) {
+  if (!sessionId) return null;
+  if (storeCache.has(sessionId)) return storeCache.get(sessionId);
+  const [rows] = await db.query(
+    `SELECT tm.toko_id AS id_toko, t.tenant_id
+     FROM toko_meta tm
+     JOIN toko t ON t.id = tm.toko_id
+     WHERE tm.meta_key = 'chat_session_id' AND tm.meta_value = ?
+     LIMIT 1`,
+    [sessionId],
+  );
+  const result = rows[0] || null;
+  storeCache.set(sessionId, result);
+  return result;
+}
+
+async function upsertChatAndMessage({
+  sessionId,
+  phone,
+  jid,
+  text,
+  direction, // 'in' | 'out'
+  fromMe,
+  messageType,
+  externalId,
+  timestamp,
+  id_toko = DEFAULT_ID_TOKO,
+  tenant_id = DEFAULT_TENANT_ID,
+  quotedText = null,
+  quotedExternalId = null,
+}) {
+  const ts = formatTimestamp(timestamp || Date.now());
+  const lastSnippet = text ? text.slice(0, 120) : null;
+  return withDb(async (conn) => {
+    let chatId;
+    const [existing] = await conn.query(
+      "SELECT id FROM whatsapp_chats WHERE session_id = ? AND jid = ? LIMIT 1",
+      [sessionId, jid],
+    );
+    if (existing.length) {
+      chatId = existing[0].id;
+      await conn.query(
+        `UPDATE whatsapp_chats
+         SET phone = COALESCE(?, phone),
+             id_toko = COALESCE(?, id_toko),
+             last_message_at = ?,
+             last_message_snippet = ?,
+             unread_count = unread_count + ?,
+             updated_at = NOW()
+         WHERE id = ?`,
+        [
+          phone || null,
+          id_toko,
+          ts,
+          lastSnippet,
+          direction === "in" ? 1 : 0,
+          chatId,
+        ],
+      );
+    } else {
+      const [insert] = await conn.query(
+        `INSERT INTO whatsapp_chats
+         (tenant_id, id_toko, phone, jid, session_id, display_name,
+          last_message_at, last_message_snippet, unread_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, NOW(), NOW())`,
+        [
+          tenant_id,
+          id_toko,
+          phone || null,
+          jid,
+          sessionId,
+          ts,
+          lastSnippet,
+          direction === "in" ? 1 : 0,
+        ],
+      );
+      chatId = insert.insertId;
+    }
+
+    const [msgInsert] = await conn.query(
+      `INSERT INTO whatsapp_messages
+       (tenant_id, id_toko, chat_id, direction, from_me, message_type, text,
+        media_path, media_mime, external_message_id, session_id, status,
+        quoted_message_id, quoted_text, received_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, NOW())`,
+      [
+        tenant_id,
+        id_toko,
+        chatId,
+        direction,
+        fromMe ? 1 : 0,
+        messageType || "text",
+        text || null,
+        externalId,
+        sessionId,
+        "pending",
+        quotedExternalId,
+        quotedText,
+        ts,
+      ],
+    );
+
+    const [chatRows] = await conn.query(
+      "SELECT * FROM whatsapp_chats WHERE id = ? LIMIT 1",
+      [chatId],
+    );
+    const [msgRows] = await conn.query(
+      "SELECT * FROM whatsapp_messages WHERE id = ? LIMIT 1",
+      [msgInsert.insertId],
+    );
+    return { chat: chatRows[0], message: msgRows[0] };
+  });
+}
+
+async function updateMessageStatus(externalId, status) {
+  if (!externalId) return;
+  await withDb((conn) =>
+    conn.query(
+      "UPDATE whatsapp_messages SET status = ?, updated_at = NOW() WHERE external_message_id = ?",
+      [status, externalId],
+    ),
+  );
+}
+
+async function fetchChats(sessionId = null, id_toko = null) {
+  return withDb((conn) =>
+    conn
+      .query(
+        `SELECT * FROM whatsapp_chats
+         WHERE (? IS NULL OR session_id = ?)
+           AND (? IS NULL OR id_toko = ?)
+         ORDER BY updated_at DESC`,
+        [sessionId, sessionId, id_toko, id_toko],
+      )
+      .then(([rows]) => rows),
+  );
+}
+
+async function fetchMessages(chatId, limit = 50) {
+  return withDb((conn) =>
+    conn
+      .query(
+        `SELECT * FROM whatsapp_messages
+         WHERE chat_id = ?
+         ORDER BY id DESC
+         LIMIT ?`,
+        [chatId, limit],
+      )
+      .then(([rows]) => rows.reverse()),
+  );
+}
+
+async function markChatRead(chatId) {
+  await withDb((conn) =>
+    conn.query(
+      `UPDATE whatsapp_chats
+       SET unread_count = 0, updated_at = NOW()
+       WHERE id = ?`,
+      [chatId],
+    ),
+  );
+  const [rows] = await withDb((conn) =>
+    conn.query("SELECT * FROM whatsapp_chats WHERE id = ? LIMIT 1", [chatId]),
+  );
+  return rows[0];
+}
+
+function matchIdToko(clientIdToko, rowIdToko) {
+  if (clientIdToko === undefined || clientIdToko === null) return true;
+  return rowIdToko === clientIdToko;
+}
+
+function broadcastChatUpdate(chat) {
+  if (!wss) return;
+  for (const ws of wss.clients) {
+    if (
+      ws.readyState === WebSocket.OPEN &&
+      (ws.meta?.sessionId === null || ws.meta?.sessionId === chat.session_id) &&
+      matchIdToko(ws.meta?.id_toko, chat.id_toko)
+    ) {
+      ws.send(JSON.stringify({ type: "chat_updated", chat }));
+    }
+  }
+}
+
+function broadcastMessage(message, chat) {
+  if (!wss) return;
+  for (const ws of wss.clients) {
+    const watchChat =
+      ws.readyState === WebSocket.OPEN &&
+      ws.meta?.chatId &&
+      Number(ws.meta.chatId) === Number(chat.id);
+    if (watchChat) {
+      ws.send(
+        JSON.stringify({ type: "chat_detail_append", chatId: chat.id, message }),
+      );
+    }
+  }
+}
+
+async function sendChatList(ws) {
+  const sessionId = ws.meta?.sessionId ?? null;
+  const id_toko = ws.meta?.id_toko ?? null;
+  try {
+    const chats = await fetchChats(sessionId, id_toko);
+    ws.send(
+      JSON.stringify({ type: "chat_list", sessionId, id_toko, chats }),
+    );
+  } catch (err) {
+    ws.send(
+      JSON.stringify({ type: "error", message: `db error: ${err.message}` }),
+    );
+  }
+}
+
+async function sendChatDetail(ws, chatId) {
+  try {
+    const updatedChat = await markChatRead(chatId);
+    const messages = await fetchMessages(chatId);
+    ws.meta.chatId = chatId;
+    ws.send(JSON.stringify({ type: "chat_detail", chatId, messages, chat: updatedChat }));
+    if (updatedChat) broadcastChatUpdate(updatedChat);
+  } catch (err) {
+    ws.send(
+      JSON.stringify({ type: "error", message: `db error: ${err.message}` }),
+    );
+  }
 }
 
 // ── Simpan semua session (id + webhookUrl) ke disk ────────────────────────────
@@ -273,10 +549,15 @@ function startSession(sessionId, webhookUrl = null) {
       if (!url) return;
 
       const from = await normalizeId(message, message.from);
+      // Abaikan grup/status
+      if (!from || !from.endsWith("@c.us")) return;
+      const phone = phoneFromJid(from);
 
       const payload = {
         event: "message_in",
         sessionId,
+        jid: from,
+        phone,
         from,
         rawFrom: message.from,
         text: message.body,
@@ -326,6 +607,32 @@ function startSession(sessionId, webhookUrl = null) {
       }
 
       try {
+        const jid = from;
+        const store = await resolveStoreBySession(sessionId);
+        const tenant_id = store?.tenant_id ?? DEFAULT_TENANT_ID;
+        const id_toko = store?.id_toko ?? DEFAULT_ID_TOKO;
+        const { chat, message: savedMessage } = await upsertChatAndMessage({
+          sessionId,
+          phone,
+          jid,
+          text: message.body,
+          direction: "in",
+          fromMe: false,
+          messageType: message.type,
+          externalId: message.id.id,
+          timestamp: message.timestamp,
+          id_toko,
+          tenant_id,
+          quotedText: payload.quoted?.text || null,
+          quotedExternalId: payload.quoted?.messageId || null,
+        });
+        broadcastChatUpdate(chat);
+        broadcastMessage(savedMessage, chat);
+      } catch (err) {
+        console.error(`[${sessionId}] DB persist error:`, err.message);
+      }
+
+      try {
         logWebhookPayload(sessionId, payload);
         await axios.post(url, payload);
       } catch (err) {
@@ -343,10 +650,15 @@ function startSession(sessionId, webhookUrl = null) {
 
       const to = await normalizeId(message, message.to);
       const from = await normalizeId(message, message.from);
+      // Abaikan grup/status
+      if (!to || !to.endsWith("@c.us")) return;
+      const phone = phoneFromJid(to);
 
       const payload = {
         event: "message_out",
         sessionId,
+        jid: to,
+        phone,
         to,
         rawTo: message.to,
         from,
@@ -375,6 +687,29 @@ function startSession(sessionId, webhookUrl = null) {
       }
 
       try {
+        const store = await resolveStoreBySession(sessionId);
+        const tenant_id = store?.tenant_id ?? DEFAULT_TENANT_ID;
+        const id_toko = store?.id_toko ?? DEFAULT_ID_TOKO;
+        const { chat, message: savedMessage } = await upsertChatAndMessage({
+          sessionId,
+          phone,
+          jid: to,
+          text: message.body,
+          direction: "out",
+          fromMe: true,
+          messageType: message.type,
+          externalId: message.id.id,
+          timestamp: message.timestamp,
+          id_toko,
+          tenant_id,
+        });
+        broadcastChatUpdate(chat);
+        broadcastMessage(savedMessage, chat);
+      } catch (err) {
+        console.error(`[${sessionId}] DB persist error:`, err.message);
+      }
+
+      try {
         logWebhookPayload(sessionId, payload);
         await axios.post(url, payload);
       } catch (err) {
@@ -390,6 +725,8 @@ function startSession(sessionId, webhookUrl = null) {
 
       const from = await normalizeId(message, message.from);
       const to = await normalizeId(message, message.to);
+      if (!to || !to.endsWith("@c.us")) return;
+      const phone = phoneFromJid(to);
 
       const payload = {
         event: "message_ack",
@@ -400,10 +737,18 @@ function startSession(sessionId, webhookUrl = null) {
         rawFrom: message.from,
         to,
         rawTo: message.to,
+        phone,
+        jid: to,
         ack,
         status: ACK_STATUS[ack] || "unknown",
         timestamp: message.timestamp,
       };
+
+      try {
+        await updateMessageStatus(message.id.id, ACK_STATUS[ack] || "unknown");
+      } catch (err) {
+        console.error(`[${sessionId}] DB ack update error:`, err.message);
+      }
 
       try {
         logWebhookPayload(sessionId, payload);
@@ -666,16 +1011,17 @@ app.post("/api/session/read", async (req, res) => {
 
 const server = http.createServer(app);
 
-const wss = new WebSocket.Server({ noServer: true });
+wss = new WebSocket.Server({ noServer: true });
 
 wss.on("connection", (ws, req) => {
+  ws.meta = {};
   const url = new URL(req.url, `http://${req.headers.host}`);
   const qs = Object.fromEntries(url.searchParams.entries());
 
   // Info awal (bisa diisi token auth sendiri, contohnya dari qs.auth)
   ws.send(JSON.stringify({ event: "ws_connected", info: { query: qs } }));
 
-  ws.on("message", (raw) => {
+  ws.on("message", async (raw) => {
     let payload;
     try {
       payload = JSON.parse(raw);
@@ -715,6 +1061,26 @@ wss.on("connection", (ws, req) => {
       const channel = payload.channel || null;
       const fullRoom = channel ? `${payload.room}-${channel}` : payload.room;
       broadcastRoom(fullRoom, { event: "message", room: payload.room, channel, data: payload.data }, ws);
+      return;
+    }
+
+    if (action === "join_list") {
+      ws.meta.sessionId = payload.sessionId || null;
+      ws.meta.id_toko =
+        payload.id_toko === undefined || payload.id_toko === null
+          ? null
+          : Number(payload.id_toko);
+      await sendChatList(ws);
+      return;
+    }
+
+    if (action === "join_chat") {
+      if (!payload.chatId) {
+        ws.send(JSON.stringify({ event: "error", message: "chatId missing" }));
+        return;
+      }
+      ws.meta.chatId = Number(payload.chatId);
+      await sendChatDetail(ws, ws.meta.chatId);
       return;
     }
 
