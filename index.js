@@ -36,6 +36,41 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function normalizeId(message, id) {
+  if (!id) return null;
+
+  // already canonical WA chat IDs
+  if (id.endsWith("@c.us") || id.endsWith("@g.us") || id.endsWith("@broadcast")) {
+    return id;
+  }
+
+  // Special case lid id: try fetch contact data
+  try {
+    if (typeof message.getContact === "function") {
+      const contact = await message.getContact();
+      if (contact?.id?._serialized) return contact.id._serialized;
+      if (contact?.id?.user) return `${contact.id.user}@c.us`;
+      if (contact?.number) return `${contact.number}@c.us`;
+    }
+  } catch (err) {
+    // ignore resolution failure and return original
+  }
+
+  return id;
+}
+
+function logWebhookPayload(sessionId, payload) {
+  // Hindari spam besar: ringkas field media.data
+  const clone = { ...payload };
+  if (payload.media?.data) {
+    clone.media = {
+      ...payload.media,
+      dataLength: payload.media.data.length,
+    };
+  }
+  console.log(`[${sessionId}] Webhook payload:`, JSON.stringify(clone, null, 2));
+}
+
 // ── Simpan semua session (id + webhookUrl) ke disk ────────────────────────────
 async function persistSessions() {
   const data = {};
@@ -193,10 +228,13 @@ function startSession(sessionId, webhookUrl = null) {
       const url = session?.webhookUrl;
       if (!url) return;
 
+      const from = await normalizeId(message, message.from);
+
       const payload = {
         event: "message_in",
         sessionId,
-        from: message.from,
+        from,
+        rawFrom: message.from,
         text: message.body,
         timestamp: message.timestamp,
         messageId: message.id.id,
@@ -226,9 +264,11 @@ function startSession(sessionId, webhookUrl = null) {
       if (message.hasQuotedMsg) {
         try {
           const quoted = await message.getQuotedMessage();
+          const quotedFrom = await normalizeId(quoted, quoted.from);
           payload.quoted = {
             messageId: quoted.id.id,
-            from: quoted.from,
+            from: quotedFrom,
+            rawFrom: quoted.from,
             text: quoted.body,
             timestamp: quoted.timestamp,
             type: quoted.type,
@@ -242,6 +282,7 @@ function startSession(sessionId, webhookUrl = null) {
       }
 
       try {
+        logWebhookPayload(sessionId, payload);
         await axios.post(url, payload);
       } catch (err) {
         console.error(`[${sessionId}] Webhook failed:`, err.message);
@@ -256,11 +297,16 @@ function startSession(sessionId, webhookUrl = null) {
       const url = session?.webhookUrl;
       if (!url) return;
 
+      const to = await normalizeId(message, message.to);
+      const from = await normalizeId(message, message.from);
+
       const payload = {
         event: "message_out",
         sessionId,
-        to: message.to,
-        from: message.from,
+        to,
+        rawTo: message.to,
+        from,
+        rawFrom: message.from,
         text: message.body,
         timestamp: message.timestamp,
         messageId: message.id.id,
@@ -285,6 +331,7 @@ function startSession(sessionId, webhookUrl = null) {
       }
 
       try {
+        logWebhookPayload(sessionId, payload);
         await axios.post(url, payload);
       } catch (err) {
         console.error(`[${sessionId}] Webhook failed:`, err.message);
@@ -297,19 +344,25 @@ function startSession(sessionId, webhookUrl = null) {
       const url = session?.webhookUrl;
       if (!url) return;
 
+      const from = await normalizeId(message, message.from);
+      const to = await normalizeId(message, message.to);
+
       const payload = {
         event: "message_ack",
         sessionId,
         messageId: message.id.id,
         fromMe: message.fromMe,
-        from: message.from,
-        to: message.to,
+        from,
+        rawFrom: message.from,
+        to,
+        rawTo: message.to,
         ack,
         status: ACK_STATUS[ack] || "unknown",
         timestamp: message.timestamp,
       };
 
       try {
+        logWebhookPayload(sessionId, payload);
         await axios.post(url, payload);
       } catch (err) {
         console.error(`[${sessionId}] Webhook failed:`, err.message);
@@ -395,6 +448,39 @@ app.get("/api/session/qr/:sessionId", (req, res) => {
     });
   }
   res.json({ qr: session.qr });
+});
+
+// POST /api/session/regenerate-qr/:sessionId
+// Regenerate QR code untuk session yang sudah ada (misal jika disconnected atau perlu login ulang)
+app.post("/api/session/regenerate-qr/:sessionId", async (req, res) => {
+  const { sessionId } = req.params;
+
+  const session = sessions.get(sessionId);
+  if (!session) return res.status(404).json({ error: "Session not found" });
+
+  // Destroy client jika ada
+  try {
+    await session.client.destroy();
+  } catch (_) {}
+
+  // Hapus auth folder untuk force regenerate QR
+  const authPath = path.join(__dirname, ".wwebjs_auth", `session-${sessionId}`);
+  try {
+    await fs.rm(authPath, { recursive: true, force: true });
+  } catch (_) {}
+
+  // Hapus dari map
+  sessions.delete(sessionId);
+
+  // Start ulang session dengan webhook yang sama
+  try {
+    const result = await startSession(sessionId, session.webhookUrl);
+    await persistSessions();
+    res.json(result);
+  } catch (err) {
+    sessions.delete(sessionId);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /api/session/status/:sessionId
