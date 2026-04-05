@@ -115,7 +115,11 @@ async function normalizeId(message, id) {
   if (!id) return null;
 
   // already canonical WA chat IDs
-  if (id.endsWith("@c.us") || id.endsWith("@g.us") || id.endsWith("@broadcast")) {
+  if (
+    id.endsWith("@c.us") ||
+    id.endsWith("@g.us") ||
+    id.endsWith("@broadcast")
+  ) {
     return id;
   }
 
@@ -157,16 +161,54 @@ function canonicalJid(id) {
   return id;
 }
 
+/**
+ * Upload base64 media ke API external dan kembalikan URL-nya.
+ */
+async function uploadMediaToExternal(media) {
+  if (!process.env.CHAT_API_BASE_URL) {
+    // console.warn("[Upload] CHAT_API_BASE_URL not set, skipping media upload");
+    return null;
+  }
+
+  try {
+    const formData = new FormData();
+    const buffer = Buffer.from(media.data, "base64");
+    const blob = new Blob([buffer], { type: media.mimetype });
+    formData.append("file", blob, media.filename || "upload.jpg");
+    formData.append("folder", "transactions");
+
+    const response = await axios.post(
+      `${process.env.CHAT_API_BASE_URL}/v2/upload/image`,
+      formData,
+      {
+        headers: { "Content-Type": "multipart/form-data" },
+      },
+    );
+
+    if (response.data?.status && response.data?.data?.url) {
+      return response.data.data.url;
+    }
+  } catch (err) {
+    console.error(
+      "[Upload] Failed to upload media:",
+      err.response?.data || err.message,
+    );
+  }
+  return null;
+}
+
 function logWebhookPayload(sessionId, payload) {
-  // Hindari spam besar: ringkas field media.data
   const clone = { ...payload };
   if (payload.media?.data) {
     clone.media = {
       ...payload.media,
-      dataLength: payload.media.data.length,
+      data: `[BASE64 DATA: ${payload.media.data.length} chars]`,
     };
   }
-  //console.log(`[${sessionId}] Webhook payload:`, JSON.stringify(clone, null, 2));
+  console.log(
+    `[${sessionId}] Webhook payload:`,
+    JSON.stringify(clone, null, 2),
+  );
 }
 
 function formatTimestamp(ts) {
@@ -230,6 +272,8 @@ async function upsertChatAndMessage({
   tenant_id = DEFAULT_TENANT_ID,
   quotedText = null,
   quotedExternalId = null,
+  mediaPath = null,
+  mediaMime = null,
 }) {
   const ts = formatTimestamp(timestamp || Date.now());
   const lastSnippet = text ? text.slice(0, 120) : null;
@@ -309,7 +353,7 @@ async function upsertChatAndMessage({
        (tenant_id, id_toko, chat_id, direction, from_me, message_type, text,
         media_path, media_mime, external_message_id, session_id, status,
         quoted_message_id, quoted_text, received_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, NOW())`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
       [
         tenant_id,
         id_toko,
@@ -318,6 +362,8 @@ async function upsertChatAndMessage({
         fromMe ? 1 : 0,
         messageType || "text",
         text || null,
+        mediaPath || null,
+        mediaMime || null,
         externalId,
         sessionId,
         "pending",
@@ -454,7 +500,8 @@ function broadcastChatUpdate(chat) {
   for (const ws of wss.clients) {
     if (
       ws.readyState === WebSocket.OPEN &&
-      (ws.meta?.sessionId === null || ws.meta?.sessionId === enriched.session_id) &&
+      (ws.meta?.sessionId === null ||
+        ws.meta?.sessionId === enriched.session_id) &&
       matchIdToko(ws.meta?.id_toko, enriched.id_toko)
     ) {
       ws.send(JSON.stringify({ type: "chat_updated", chat: enriched }));
@@ -481,13 +528,20 @@ async function broadcastMessage(message, chat) {
       const updatedChat = await markChatRead(chat.id);
       if (updatedChat) currentChat = updatedChat;
     } catch (err) {
-      console.error(`[${chat.session_id}] markRead on broadcast failed:`, err.message);
+      console.error(
+        `[${chat.session_id}] markRead on broadcast failed:`,
+        err.message,
+      );
     }
   }
 
   for (const ws of watchers) {
     ws.send(
-      JSON.stringify({ type: "chat_detail_append", chatId: currentChat.id, message }),
+      JSON.stringify({
+        type: "chat_detail_append",
+        chatId: currentChat.id,
+        message,
+      }),
     );
   }
 
@@ -524,9 +578,7 @@ async function sendChatList(ws) {
   const id_toko = ws.meta?.id_toko ?? null;
   try {
     const chats = await fetchChats(sessionId, id_toko);
-    ws.send(
-      JSON.stringify({ type: "chat_list", sessionId, id_toko, chats }),
-    );
+    ws.send(JSON.stringify({ type: "chat_list", sessionId, id_toko, chats }));
   } catch (err) {
     ws.send(
       JSON.stringify({ type: "error", message: `db error: ${err.message}` }),
@@ -539,7 +591,14 @@ async function sendChatDetail(ws, chatId) {
     const updatedChat = await markChatRead(chatId);
     const messages = await fetchMessages(chatId);
     ws.meta.chatId = chatId;
-    ws.send(JSON.stringify({ type: "chat_detail", chatId, messages, chat: updatedChat }));
+    ws.send(
+      JSON.stringify({
+        type: "chat_detail",
+        chatId,
+        messages,
+        chat: updatedChat,
+      }),
+    );
     if (updatedChat) broadcastChatUpdate(updatedChat);
   } catch (err) {
     ws.send(
@@ -797,6 +856,12 @@ function startSession(sessionId, webhookUrl = null) {
         const store = await resolveStoreBySession(sessionId);
         const tenant_id = store?.tenant_id ?? DEFAULT_TENANT_ID;
         const id_toko = store?.id_toko ?? DEFAULT_ID_TOKO;
+
+        let mediaPath = null;
+        if (payload.media) {
+          mediaPath = await uploadMediaToExternal(payload.media);
+        }
+
         const { chat, message: savedMessage } = await upsertChatAndMessage({
           sessionId,
           phone,
@@ -812,6 +877,8 @@ function startSession(sessionId, webhookUrl = null) {
           tenant_id,
           quotedText: payload.quoted?.text || null,
           quotedExternalId: payload.quoted?.messageId || null,
+          mediaPath,
+          mediaMime: payload.media?.mimetype || null,
         });
         const updatedChat = await broadcastMessage(savedMessage, chat);
         broadcastChatUpdate(updatedChat || chat);
@@ -870,7 +937,7 @@ function startSession(sessionId, webhookUrl = null) {
 
       // Debug mapping for outbound (helps ensure we use correct peer JID)
       console.log(
-        `[${sessionId}] out debug: to=${to}, rawPeer=${rawPeerCandidate}, chatId=${chat?.id?._serialized}, chatUser=${chat?.id?.user}, contact=${contact?.id?._serialized}, peerContact=${peerContact?.id?._serialized}, msg.to=${message.to}, msg.from=${message.from}, msg.id.remote=${message.id?.remote}, self=${selfJid}`,
+        `[${sessionId}] out debug: to=${to}, type=${message.type}, hasMedia=${message.hasMedia}, body=${message.body?.slice(0, 50)}, rawTo=${rawPeerCandidate}, self=${selfJid}`,
       );
 
       const payload = {
@@ -889,14 +956,21 @@ function startSession(sessionId, webhookUrl = null) {
         hasMedia: message.hasMedia,
       };
 
-      if (message.hasMedia) {
+      if (
+        message.hasMedia ||
+        ["image", "video", "document"].includes(message.type)
+      ) {
         try {
+          // Beri jeda sedikit agar media siap didownload
+          await new Promise((r) => setTimeout(r, 500));
           const media = await message.downloadMedia();
-          payload.media = {
-            mimetype: media.mimetype,
-            filename: media.filename || null,
-            data: media.data, // base64
-          };
+          if (media) {
+            payload.media = {
+              mimetype: media.mimetype,
+              filename: media.filename || null,
+              data: media.data, // base64
+            };
+          }
         } catch (err) {
           console.error(
             `[${sessionId}] Failed to download outgoing media:`,
@@ -909,6 +983,12 @@ function startSession(sessionId, webhookUrl = null) {
         const store = await resolveStoreBySession(sessionId);
         const tenant_id = store?.tenant_id ?? DEFAULT_TENANT_ID;
         const id_toko = store?.id_toko ?? DEFAULT_ID_TOKO;
+
+        let mediaPath = null;
+        if (payload.media) {
+          mediaPath = await uploadMediaToExternal(payload.media);
+        }
+
         const { chat, message: savedMessage } = await upsertChatAndMessage({
           sessionId,
           phone,
@@ -922,6 +1002,8 @@ function startSession(sessionId, webhookUrl = null) {
           timestamp: message.timestamp,
           id_toko,
           tenant_id,
+          mediaPath,
+          mediaMime: payload.media?.mimetype || null,
         });
         const updatedChat = await broadcastMessage(savedMessage, chat);
         broadcastChatUpdate(updatedChat || chat);
@@ -942,12 +1024,21 @@ function startSession(sessionId, webhookUrl = null) {
       const session = sessions.get(sessionId);
       const url = session?.webhookUrl;
 
-      const from = canonicalJid(message.from) || (await normalizeId(message, message.from));
+      const from =
+        canonicalJid(message.from) ||
+        (await normalizeId(message, message.from));
       const to =
         canonicalJid(message.to) ||
         canonicalJid(message.id?.remote) ||
-        (await normalizeId(message, message.to || message.id?.remote || message.from));
-      const phone = normalizePhone(phoneFromJid(to) || message.id?.remote?.split("@")[0] || message.to?.split("@")[0]);
+        (await normalizeId(
+          message,
+          message.to || message.id?.remote || message.from,
+        ));
+      const phone = normalizePhone(
+        phoneFromJid(to) ||
+          message.id?.remote?.split("@")[0] ||
+          message.to?.split("@")[0],
+      );
       if (!to || !to.endsWith("@c.us")) return;
 
       const payload = {
@@ -1281,12 +1372,18 @@ wss.on("connection", (ws, req) => {
 
     if (action === "message") {
       if (!payload.room || !payload.data) {
-        ws.send(JSON.stringify({ event: "error", message: "room/data missing" }));
+        ws.send(
+          JSON.stringify({ event: "error", message: "room/data missing" }),
+        );
         return;
       }
       const channel = payload.channel || null;
       const fullRoom = channel ? `${payload.room}-${channel}` : payload.room;
-      broadcastRoom(fullRoom, { event: "message", room: payload.room, channel, data: payload.data }, ws);
+      broadcastRoom(
+        fullRoom,
+        { event: "message", room: payload.room, channel, data: payload.data },
+        ws,
+      );
       return;
     }
 
