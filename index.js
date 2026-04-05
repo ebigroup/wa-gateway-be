@@ -989,6 +989,23 @@ function startSession(sessionId, webhookUrl = null) {
           mediaPath = await uploadMediaToExternal(payload.media);
         }
 
+        let finalMediaPath = mediaPath;
+        let finalMediaMime = payload.media?.mimetype || null;
+
+        // Custom logic: If document message starts with "Berikut tagihan untuk pesanan kakak",
+        // Extract invoice ID (INVxxx) and store it in media_path / media_mime = transaction.
+        if (
+          message.type === "document" &&
+          message.body &&
+          message.body.startsWith("Berikut tagihan untuk pesanan kakak")
+        ) {
+          const invMatch = message.body.match(/INV[0-9A-Z]+/);
+          if (invMatch) {
+            finalMediaPath = invMatch[0];
+            finalMediaMime = "transaction";
+          }
+        }
+
         const { chat, message: savedMessage } = await upsertChatAndMessage({
           sessionId,
           phone,
@@ -1002,8 +1019,8 @@ function startSession(sessionId, webhookUrl = null) {
           timestamp: message.timestamp,
           id_toko,
           tenant_id,
-          mediaPath,
-          mediaMime: payload.media?.mimetype || null,
+          mediaPath: finalMediaPath,
+          mediaMime: finalMediaMime,
         });
         const updatedChat = await broadcastMessage(savedMessage, chat);
         broadcastChatUpdate(updatedChat || chat);
@@ -1235,18 +1252,28 @@ app.post("/api/session/send", async (req, res) => {
     text,
     // gambar via URL
     imageUrl,
-    // gambar via base64 — bisa sertakan "data:image/jpeg;base64," atau tanpa prefix
+    // gambar/file via base64 — bisa sertakan "data:application/pdf;base64," atau tanpa prefix
     imageBase64,
-    mimeType = "image/jpeg",
-    filename = "image.jpg",
+    mimeType: mimeTypeParam,
+    filename: filenameParam,
+    fileName: fileNameParam, // Alias untuk request CamelCase
     caption = "",
     // timing
     delayMs = 0,
     typingDurationMs = 2000,
   } = req.body;
 
+  const mimeType = mimeTypeParam || "image/jpeg";
+  const filename = fileNameParam || filenameParam || "image.jpg";
+
   if (!sessionId || !to) {
     return res.status(400).json({ error: "Missing: sessionId, to" });
+  }
+
+  // Auto-append @c.us if missing (assume individual contact if no @ sign)
+  let formattedTo = to.toString().trim();
+  if (!formattedTo.includes("@")) {
+    formattedTo = `${formattedTo}@c.us`;
   }
   if (!text && !imageUrl && !imageBase64) {
     return res
@@ -1269,26 +1296,32 @@ app.post("/api/session/send", async (req, res) => {
 
     if (text) {
       // ── Kirim teks dengan typing indicator ──────────────────────────────────
-      const chat = await session.client.getChatById(to);
+      const chat = await session.client.getChatById(formattedTo);
       await chat.sendStateTyping();
       await sleep(typingDurationMs);
       await chat.clearState();
-      msg = await session.client.sendMessage(to, text);
+      msg = await session.client.sendMessage(formattedTo, text);
     } else if (imageUrl) {
       // ── Kirim gambar dari URL ────────────────────────────────────────────────
       const media = await MessageMedia.fromUrl(imageUrl, { unsafeMime: true });
-      msg = await session.client.sendMessage(to, media, {
+      msg = await session.client.sendMessage(formattedTo, media, {
         caption: caption || undefined,
       });
     } else if (imageBase64) {
-      // ── Kirim gambar dari base64 ─────────────────────────────────────────────
-      // Hapus prefix "data:image/jpeg;base64," jika ada
-      const base64Data = imageBase64.includes(",")
-        ? imageBase64.split(",")[1]
-        : imageBase64;
+      // ── Kirim gambar/file dari base64 ─────────────────────────────────────────────
+      let finalMime = mimeType;
+      let finalBase64 = imageBase64;
 
-      const media = new MessageMedia(mimeType, base64Data, filename);
-      msg = await session.client.sendMessage(to, media, {
+      // Deteksi otomatis mimetype jika ada prefix "data:..."
+      if (imageBase64.includes(",")) {
+        const parts = imageBase64.split(",");
+        const match = parts[0].match(/data:(.*?);base64/);
+        if (match) finalMime = match[1];
+        finalBase64 = parts[1];
+      }
+
+      const media = new MessageMedia(finalMime, finalBase64, filename);
+      msg = await session.client.sendMessage(formattedTo, media, {
         caption: caption || undefined,
       });
     }
