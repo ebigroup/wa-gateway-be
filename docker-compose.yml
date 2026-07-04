@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  wa-gateway:
+    build: .
+    container_name: wa-gateway-be
+    restart: unless-stopped
+    ports:
+      - "3009:3009"
+    volumes:
+      - ./.wwebjs_auth:/app/.wwebjs_auth
+      - ./sessions.json:/app/sessions.json
+    environment:
+      - NODE_ENV=production
+    env_file:
+      - .env
