@@ -770,18 +770,31 @@ app.post("/api/session/send", async (req, res) => {
     if (delayMs > 0) await sleep(delayMs);
 
     let msg;
+    
+    // Pastikan nomor terdaftar di WhatsApp dan dapatkan format ID yang benar
+    const numberId = await session.client.getNumberId(formattedTo.replace("@c.us", ""));
+    if (!numberId) {
+      return res.status(400).json({ error: "Number is not registered on WhatsApp" });
+    }
+    const finalTo = numberId._serialized;
 
     if (text) {
-      // ── Kirim teks dengan typing indicator ──────────────────────────────────
-      const chat = await session.client.getChatById(formattedTo);
-      await chat.sendStateTyping();
-      await sleep(typingDurationMs);
-      await chat.clearState();
-      msg = await session.client.sendMessage(formattedTo, text);
+      // ── Kirim teks dengan typing indicator (opsional & aman) ───────────────
+      try {
+        const chat = await session.client.getChatById(finalTo);
+        if (chat) {
+          await chat.sendStateTyping();
+          await sleep(typingDurationMs);
+          await chat.clearState();
+        }
+      } catch (e) {
+        // Abaikan jika gagal mendapatkan chat
+      }
+      msg = await session.client.sendMessage(finalTo, text);
     } else if (imageUrl) {
       // ── Kirim gambar dari URL ────────────────────────────────────────────────
       const media = await MessageMedia.fromUrl(imageUrl, { unsafeMime: true });
-      msg = await session.client.sendMessage(formattedTo, media, {
+      msg = await session.client.sendMessage(finalTo, media, {
         caption: caption || undefined,
       });
     } else if (imageBase64) {
@@ -789,7 +802,6 @@ app.post("/api/session/send", async (req, res) => {
       let finalMime = mimeType;
       let finalBase64 = imageBase64;
 
-      // Deteksi otomatis mimetype jika ada prefix "data:..."
       if (imageBase64.includes(",")) {
         const parts = imageBase64.split(",");
         const match = parts[0].match(/data:(.*?);base64/);
@@ -798,7 +810,7 @@ app.post("/api/session/send", async (req, res) => {
       }
 
       const media = new MessageMedia(finalMime, finalBase64, filename);
-      msg = await session.client.sendMessage(formattedTo, media, {
+      msg = await session.client.sendMessage(finalTo, media, {
         caption: caption || undefined,
       });
     }
