@@ -207,7 +207,17 @@ async function restoreSessions() {
 
 // ── Buat dan inisialisasi client WhatsApp ─────────────────────────────────────
 function startSession(sessionId, webhookUrl = null) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
+    // Bersihkan file lock Chrome jika ada sisa dari crash sebelumnya
+    const authPath = path.join(__dirname, ".wwebjs_auth", `session-${sessionId}`);
+    try {
+      await fs.rm(path.join(authPath, "SingletonLock"), { force: true });
+      await fs.rm(path.join(authPath, "SingletonCookie"), { force: true });
+      // Di dalam container puppeteer sering nyangkut di Default folder juga
+      await fs.rm(path.join(authPath, "Default", "SingletonLock"), { force: true });
+      await fs.rm(path.join(authPath, "Default", "SingletonCookie"), { force: true });
+    } catch (_) {}
+
     const client = new Client({
       authStrategy: new LocalAuth({ clientId: sessionId }),
       puppeteer: {
