@@ -745,13 +745,31 @@ function startSession(sessionId, webhookUrl = null) {
       );
     });
 
-    client.on("ready", () => {
+    client.on("ready", async () => {
       const session = sessions.get(sessionId);
       if (session) session.status = "ready";
       console.log(`[${sessionId}] Ready`);
       updateSessionStatusMeta(sessionId, "ready").catch((e) =>
         console.error(`[${sessionId}] status meta error:`, e.message),
       );
+
+      // Kirim webhook event connected
+      const url = session?.webhookUrl || webhookUrl;
+      if (url) {
+        const payload = {
+          event: "connected",
+          sessionId,
+          status: "ready",
+          timestamp: Math.floor(Date.now() / 1000)
+        };
+        try {
+          logWebhookPayload(sessionId, payload);
+          await axios.post(url, payload);
+        } catch (err) {
+          console.error(`[${sessionId}] Webhook (connected) failed:`, err.message);
+        }
+      }
+
       if (!resolved) {
         resolved = true;
         clearTimeout(timeout);
@@ -1138,9 +1156,10 @@ async function deleteSession(sessionId) {
 // ════════════════════════ ROUTES ═════════════════════════════════════════════
 
 // POST /api/session/start
-// Body: { sessionId?, webhookUrl? }
+// Body: { phoneNumber?, sessionId?, webhookUrl? }
 app.post("/api/session/start", async (req, res) => {
-  let { sessionId, webhookUrl = null } = req.body;
+  let { sessionId, phoneNumber, webhookUrl = null } = req.body;
+  if (phoneNumber) sessionId = normalizePhone(phoneNumber) || phoneNumber;
   if (!sessionId) sessionId = generateSessionId();
 
   if (sessions.has(sessionId)) {
