@@ -825,10 +825,10 @@ app.post("/api/session/send", async (req, res) => {
       });
     }
 
-    res.json({ success: true, messageId: msg.id.id });
+    res.json({ success: true, messageId: msg?.id?.id || msg?.id?._serialized || "unknown" });
   } catch (err) {
-    console.error(`[${sessionId}] Send error:`, err.message);
-    res.status(500).json({ error: err.message });
+    console.error(`[${sessionId}] Send error:`, err?.message || err);
+    res.status(500).json({ error: err?.message || "Unknown error" });
   }
 });
 
