@@ -788,6 +788,14 @@ app.post("/api/session/send", async (req, res) => {
     }
     const finalTo = numberId._serialized;
 
+    // WORKAROUND WA BUSINESS: Paksa muat profil kontak agar WA Web mengambil LID (Linked ID) 
+    // dari server. Jika ini dilewati, pesan ke nomor baru di WA Business sering gagal terkirim (hanya centang 1 lokal).
+    try {
+      await session.client.getContactById(finalTo);
+    } catch (e) {
+      console.warn(`[${sessionId}] getContactById failed for ${finalTo}:`, e.message);
+    }
+
     if (text) {
       // ── Kirim teks dengan typing indicator (opsional & aman) ───────────────
       try {
