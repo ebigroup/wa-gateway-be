@@ -1,14 +1,11 @@
 require("dotenv").config();
 const express = require("express");
-const http = require("http");
-const WebSocket = require("ws");
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const QRCode = require("qrcode");
 const axios = require("axios");
 const fs = require("fs").promises;
 const path = require("path");
 const { randomBytes } = require("crypto");
-const mysql = require("mysql2/promise");
 
 // Jangan biarkan proses mati karena error yang bisa kita log
 process.on("unhandledRejection", (reason, p) => {
@@ -32,76 +29,12 @@ const app = express();
 app.use(express.json({ limit: "20mb" })); // perlu limit besar untuk kirim image base64
 
 const PORT = process.env.PORT || 3009;
-const DB_HOST = process.env.DB_HOST || "153.92.15.39";
-const DB_NAME = process.env.DB_NAME || "u623463806_hope_stg";
-const DB_USER = process.env.DB_USER || "u623463806_admin";
-const DB_PASS = process.env.DB_PASS || "AsikAsikJos!23";
-const DB_PORT = Number(process.env.DB_PORT || 3306);
-const DEFAULT_TENANT_ID = Number(process.env.DEFAULT_TENANT_ID || 1);
-const DEFAULT_ID_TOKO =
-  process.env.DEFAULT_ID_TOKO === undefined
-    ? null
-    : Number(process.env.DEFAULT_ID_TOKO);
 
 // sessions.json menyimpan: { sessionId: { webhookUrl } }
 const SESSIONS_FILE = path.join(__dirname, "sessions.json");
 
 // sessionId -> { client, qr, status, webhookUrl }
 const sessions = new Map();
-
-// MySQL pool
-const db = mysql.createPool({
-  host: DB_HOST,
-  user: DB_USER,
-  password: DB_PASS,
-  database: DB_NAME,
-  port: DB_PORT,
-  waitForConnections: true,
-  connectionLimit: 10,
-});
-
-// WebSocket room state
-const rooms = new Map(); // roomName -> Set<ws>
-let wss = null;
-
-function broadcastRoom(room, message, excludeWs = null) {
-  const clients = rooms.get(room);
-  if (!clients) return;
-  const data = typeof message === "string" ? message : JSON.stringify(message);
-  for (const ws of clients) {
-    if (ws !== excludeWs && ws.readyState === WebSocket.OPEN) {
-      ws.send(data);
-    }
-  }
-}
-
-function joinRoom(ws, room, channel = null) {
-  const fullRoom = channel ? `${room}-${channel}` : room;
-  if (!rooms.has(fullRoom)) rooms.set(fullRoom, new Set());
-  rooms.get(fullRoom).add(ws);
-  if (!ws.rooms) ws.rooms = new Set();
-  ws.rooms.add(fullRoom);
-}
-
-function leaveRoom(ws, room, channel = null) {
-  const fullRoom = channel ? `${room}-${channel}` : room;
-  const roomClients = rooms.get(fullRoom);
-  if (!roomClients) return;
-  roomClients.delete(ws);
-  if (roomClients.size === 0) rooms.delete(fullRoom);
-  ws.rooms?.delete(fullRoom);
-}
-
-function leaveAllRooms(ws) {
-  if (!ws.rooms) return;
-  for (const room of ws.rooms) {
-    const roomClients = rooms.get(room);
-    if (!roomClients) continue;
-    roomClients.delete(ws);
-    if (roomClients.size === 0) rooms.delete(room);
-  }
-  ws.rooms.clear();
-}
 
 function generateSessionId() {
   return randomBytes(8).toString("hex");
@@ -217,395 +150,7 @@ function formatTimestamp(ts) {
   return new Date(ms).toISOString().slice(0, 19).replace("T", " ");
 }
 
-async function withDb(fn) {
-  const conn = await db.getConnection();
-  try {
-    return await fn(conn);
-  } finally {
-    conn.release();
-  }
-}
 
-const storeCache = new Map(); // sessionId -> { id_toko, tenant_id }
-
-async function resolveStoreBySession(sessionId) {
-  if (!sessionId) return null;
-  if (storeCache.has(sessionId)) return storeCache.get(sessionId);
-  const [rows] = await db.query(
-    `SELECT tm.toko_id AS id_toko, t.tenant_id
-     FROM toko_meta tm
-     JOIN toko t ON t.id = tm.toko_id
-     WHERE tm.meta_key = 'chat_session_id' AND tm.meta_value = ?
-     LIMIT 1`,
-    [sessionId],
-  );
-  const result = rows[0] || null;
-  storeCache.set(sessionId, result);
-  return result;
-}
-
-async function updateSessionStatusMeta(sessionId, status) {
-  const store = await resolveStoreBySession(sessionId);
-  if (!store?.id_toko) return;
-  await withDb((conn) =>
-    conn.query(
-      `UPDATE toko_meta
-         SET meta_value = ?, updated_at = NOW()
-       WHERE toko_id = ? AND meta_key = 'chat_session_status'`,
-      [status, store.id_toko],
-    ),
-  );
-}
-
-async function upsertChatAndMessage({
-  sessionId,
-  phone,
-  jid,
-  chatJid,
-  text,
-  direction, // 'in' | 'out'
-  fromMe,
-  messageType,
-  externalId,
-  timestamp,
-  id_toko = DEFAULT_ID_TOKO,
-  tenant_id = DEFAULT_TENANT_ID,
-  quotedText = null,
-  quotedExternalId = null,
-  mediaPath = null,
-  mediaMime = null,
-}) {
-  const ts = formatTimestamp(timestamp || Date.now());
-  const lastSnippet = text ? text.slice(0, 120) : null;
-  return withDb(async (conn) => {
-    let chatId;
-    // Cari berdasar phone dulu (karena sudah dinormalisasi), lalu jid
-    const [existingPhone] = await conn.query(
-      `SELECT id FROM whatsapp_chats
-         WHERE session_id = ? AND phone = ?
-         LIMIT 1`,
-      [sessionId, phone],
-    );
-    const [existingJid] = await conn.query(
-      `SELECT id FROM whatsapp_chats
-         WHERE session_id = ? AND jid = ?
-         LIMIT 1`,
-      [sessionId, jid],
-    );
-    const [existingChatJid] = await conn.query(
-      `SELECT id FROM whatsapp_chats
-         WHERE session_id = ? AND jid = ?
-         LIMIT 1`,
-      [sessionId, chatJid],
-    );
-
-    if (existingPhone.length) {
-      chatId = existingPhone[0].id;
-    } else if (existingJid.length) {
-      chatId = existingJid[0].id;
-    } else if (existingChatJid.length) {
-      chatId = existingChatJid[0].id;
-    }
-
-    if (chatId) {
-      await conn.query(
-        `UPDATE whatsapp_chats
-         SET phone = COALESCE(?, phone),
-             jid = COALESCE(?, jid),
-             id_toko = COALESCE(?, id_toko),
-             last_message_at = ?,
-             last_message_snippet = ?,
-             unread_count = unread_count + ?,
-             updated_at = NOW()
-         WHERE id = ?`,
-        [
-          phone || null,
-          chatJid || jid || null,
-          id_toko,
-          ts,
-          lastSnippet,
-          direction === "in" ? 1 : 0,
-          chatId,
-        ],
-      );
-    } else {
-      const [insert] = await conn.query(
-        `INSERT INTO whatsapp_chats
-         (tenant_id, id_toko, phone, jid, session_id, display_name,
-          last_message_at, last_message_snippet, unread_count, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, NOW(), NOW())`,
-        [
-          tenant_id,
-          id_toko,
-          phone || null,
-          chatJid || jid || null,
-          sessionId,
-          ts,
-          lastSnippet,
-          direction === "in" ? 1 : 0,
-        ],
-      );
-      chatId = insert.insertId;
-    }
-
-    const [msgInsert] = await conn.query(
-      `INSERT INTO whatsapp_messages
-       (tenant_id, id_toko, chat_id, direction, from_me, message_type, text,
-        media_path, media_mime, external_message_id, session_id, status,
-        quoted_message_id, quoted_text, received_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
-      [
-        tenant_id,
-        id_toko,
-        chatId,
-        direction,
-        fromMe ? 1 : 0,
-        messageType || "text",
-        text || null,
-        mediaPath || null,
-        mediaMime || null,
-        externalId,
-        sessionId,
-        "pending",
-        quotedExternalId,
-        quotedText,
-        ts,
-      ],
-    );
-
-    const [chatRows] = await conn.query(
-      "SELECT * FROM whatsapp_chats WHERE id = ? LIMIT 1",
-      [chatId],
-    );
-    const [msgRows] = await conn.query(
-      "SELECT * FROM whatsapp_messages WHERE id = ? LIMIT 1",
-      [msgInsert.insertId],
-    );
-    return { chat: chatRows[0], message: msgRows[0] };
-  });
-}
-
-async function updateMessageStatus(externalId, status) {
-  if (!externalId) return;
-  return withDb(async (conn) => {
-    await conn.query(
-      "UPDATE whatsapp_messages SET status = ?, updated_at = NOW() WHERE external_message_id = ?",
-      [status, externalId],
-    );
-    const [rows] = await conn.query(
-      "SELECT * FROM whatsapp_messages WHERE external_message_id = ? LIMIT 1",
-      [externalId],
-    );
-    return rows[0] || null;
-  });
-}
-
-async function fetchChats(sessionId = null, id_toko = null) {
-  const rows = await withDb((conn) =>
-    conn
-      .query(
-        `SELECT wc.*,
-                COALESCE(wc.display_name, c.nama_customer) AS display_name,
-                c.nama_customer
-         FROM whatsapp_chats wc
-         LEFT JOIN customer c ON c.no_hp_customer = wc.phone
-         WHERE (? IS NULL OR wc.session_id = ?)
-           AND (? IS NULL OR wc.id_toko = ?)
-         ORDER BY wc.updated_at DESC`,
-        [sessionId, sessionId, id_toko, id_toko],
-      )
-      .then(([rows]) => rows),
-  );
-
-  if (!rows.length) return rows;
-
-  const chatIds = rows.map((r) => r.id);
-  const labelRows = await withDb((conn) =>
-    conn
-      .query(
-        `SELECT cl.chat_id,
-                cl.label_id,
-                l.name,
-                l.color
-         FROM whatsapp_chat_labels cl
-         JOIN whatsapp_labels l ON l.id = cl.label_id
-         WHERE cl.chat_id IN (${chatIds.map(() => "?").join(",")})`,
-        chatIds,
-      )
-      .then(([r]) => r),
-  );
-
-  const labelMap = new Map();
-  for (const lr of labelRows) {
-    if (!labelMap.has(lr.chat_id)) labelMap.set(lr.chat_id, []);
-    labelMap.get(lr.chat_id).push({
-      label_id: lr.label_id,
-      name: lr.name,
-      color: lr.color,
-    });
-  }
-
-  return rows.map((row) => ({
-    ...row,
-    labels: labelMap.get(row.id) || [],
-  }));
-}
-
-async function fetchMessages(chatId, limit = 50) {
-  return withDb((conn) =>
-    conn
-      .query(
-        `SELECT * FROM whatsapp_messages
-         WHERE chat_id = ?
-         ORDER BY id DESC
-         LIMIT ?`,
-        [chatId, limit],
-      )
-      .then(([rows]) => rows.reverse()),
-  );
-}
-
-async function markChatRead(chatId) {
-  await withDb((conn) =>
-    conn.query(
-      `UPDATE whatsapp_chats
-       SET unread_count = 0, updated_at = NOW()
-       WHERE id = ?`,
-      [chatId],
-    ),
-  );
-  const [rows] = await withDb((conn) =>
-    conn.query("SELECT * FROM whatsapp_chats WHERE id = ? LIMIT 1", [chatId]),
-  );
-  return rows[0];
-}
-
-function matchIdToko(clientIdToko, rowIdToko) {
-  if (clientIdToko === undefined || clientIdToko === null) return true;
-  return rowIdToko === clientIdToko;
-}
-
-function enrichChatForBroadcast(chat) {
-  if (!chat) return chat;
-  return {
-    ...chat,
-    display_name: chat.display_name ?? chat.nama_customer ?? chat.displayName,
-    labels: chat.labels || [],
-  };
-}
-
-function broadcastChatUpdate(chat) {
-  if (!wss) return;
-  const enriched = enrichChatForBroadcast(chat);
-  for (const ws of wss.clients) {
-    if (
-      ws.readyState === WebSocket.OPEN &&
-      (ws.meta?.sessionId === null ||
-        ws.meta?.sessionId === enriched.session_id) &&
-      matchIdToko(ws.meta?.id_toko, enriched.id_toko)
-    ) {
-      ws.send(JSON.stringify({ type: "chat_updated", chat: enriched }));
-    }
-  }
-}
-
-async function broadcastMessage(message, chat) {
-  if (!wss) return chat;
-
-  const watchers = [];
-  for (const ws of wss.clients) {
-    const watchChat =
-      ws.readyState === WebSocket.OPEN &&
-      ws.meta?.chatId &&
-      Number(ws.meta.chatId) === Number(chat.id);
-    if (watchChat) watchers.push(ws);
-  }
-
-  // Jika ada yang sedang membuka chat ini dan pesan masuk, tandai sebagai dibaca
-  let currentChat = chat;
-  if (watchers.length && message.direction === "in") {
-    try {
-      const updatedChat = await markChatRead(chat.id);
-      if (updatedChat) currentChat = updatedChat;
-    } catch (err) {
-      console.error(
-        `[${chat.session_id}] markRead on broadcast failed:`,
-        err.message,
-      );
-    }
-  }
-
-  for (const ws of watchers) {
-    ws.send(
-      JSON.stringify({
-        type: "chat_detail_append",
-        chatId: currentChat.id,
-        message,
-      }),
-    );
-  }
-
-  // Update list view dengan unread terbaru jika berubah
-  if (message.direction === "in" && watchers.length) {
-    broadcastChatUpdate(currentChat);
-  }
-
-  return currentChat;
-}
-
-function broadcastMessageStatus(message) {
-  if (!wss || !message) return;
-  for (const ws of wss.clients) {
-    const watchChat =
-      ws.readyState === WebSocket.OPEN &&
-      ws.meta?.chatId &&
-      Number(ws.meta.chatId) === Number(message.chat_id);
-    if (watchChat) {
-      ws.send(
-        JSON.stringify({
-          type: "message_status",
-          chatId: message.chat_id,
-          messageId: message.external_message_id,
-          status: message.status,
-        }),
-      );
-    }
-  }
-}
-
-async function sendChatList(ws) {
-  const sessionId = ws.meta?.sessionId ?? null;
-  const id_toko = ws.meta?.id_toko ?? null;
-  try {
-    const chats = await fetchChats(sessionId, id_toko);
-    ws.send(JSON.stringify({ type: "chat_list", sessionId, id_toko, chats }));
-  } catch (err) {
-    ws.send(
-      JSON.stringify({ type: "error", message: `db error: ${err.message}` }),
-    );
-  }
-}
-
-async function sendChatDetail(ws, chatId) {
-  try {
-    const updatedChat = await markChatRead(chatId);
-    const messages = await fetchMessages(chatId);
-    ws.meta.chatId = chatId;
-    ws.send(
-      JSON.stringify({
-        type: "chat_detail",
-        chatId,
-        messages,
-        chat: updatedChat,
-      }),
-    );
-    if (updatedChat) broadcastChatUpdate(updatedChat);
-  } catch (err) {
-    ws.send(
-      JSON.stringify({ type: "error", message: `db error: ${err.message}` }),
-    );
-  }
-}
 
 // ── Simpan semua session (id + webhookUrl) ke disk ────────────────────────────
 async function persistSessions() {
@@ -740,18 +285,12 @@ function startSession(sessionId, webhookUrl = null) {
         session.qr = null;
       }
       console.log(`[${sessionId}] Authenticated`);
-      updateSessionStatusMeta(sessionId, "authenticated").catch((e) =>
-        console.error(`[${sessionId}] status meta error:`, e.message),
-      );
     });
 
     client.on("ready", async () => {
       const session = sessions.get(sessionId);
       if (session) session.status = "ready";
       console.log(`[${sessionId}] Ready`);
-      updateSessionStatusMeta(sessionId, "ready").catch((e) =>
-        console.error(`[${sessionId}] status meta error:`, e.message),
-      );
 
       // Kirim webhook event connected
       const url = session?.webhookUrl || webhookUrl;
@@ -785,18 +324,12 @@ function startSession(sessionId, webhookUrl = null) {
       console.log(`[${sessionId}] Disconnected:`, reason);
       const session = sessions.get(sessionId);
       if (session) session.status = "disconnected";
-      updateSessionStatusMeta(sessionId, `disconnected:${reason || ""}`).catch(
-        (e) => console.error(`[${sessionId}] status meta error:`, e.message),
-      );
     });
 
     client.on("auth_failure", (msg) => {
       console.error(`[${sessionId}] Auth failure:`, msg);
       const session = sessions.get(sessionId);
       if (session) session.status = "disconnected";
-      updateSessionStatusMeta(sessionId, "auth_failure").catch((e) =>
-        console.error(`[${sessionId}] status meta error:`, e.message),
-      );
       if (!resolved) {
         resolved = true;
         clearTimeout(timeout);
@@ -884,39 +417,7 @@ function startSession(sessionId, webhookUrl = null) {
         }
       }
 
-      try {
-        const store = await resolveStoreBySession(sessionId);
-        const tenant_id = store?.tenant_id ?? DEFAULT_TENANT_ID;
-        const id_toko = store?.id_toko ?? DEFAULT_ID_TOKO;
 
-        let mediaPath = null;
-        if (payload.media) {
-          mediaPath = await uploadMediaToExternal(payload.media);
-        }
-
-        const { chat, message: savedMessage } = await upsertChatAndMessage({
-          sessionId,
-          phone,
-          jid: from,
-          chatJid,
-          text: message.body,
-          direction: "in",
-          fromMe: false,
-          messageType: message.type,
-          externalId: message.id.id,
-          timestamp: message.timestamp,
-          id_toko,
-          tenant_id,
-          quotedText: payload.quoted?.text || null,
-          quotedExternalId: payload.quoted?.messageId || null,
-          mediaPath,
-          mediaMime: payload.media?.mimetype || null,
-        });
-        const updatedChat = await broadcastMessage(savedMessage, chat);
-        broadcastChatUpdate(updatedChat || chat);
-      } catch (err) {
-        console.error(`[${sessionId}] DB persist error:`, err.message);
-      }
 
       try {
         logWebhookPayload(sessionId, payload);
@@ -1011,54 +512,7 @@ function startSession(sessionId, webhookUrl = null) {
         }
       }
 
-      try {
-        const store = await resolveStoreBySession(sessionId);
-        const tenant_id = store?.tenant_id ?? DEFAULT_TENANT_ID;
-        const id_toko = store?.id_toko ?? DEFAULT_ID_TOKO;
 
-        let mediaPath = null;
-        if (payload.media) {
-          mediaPath = await uploadMediaToExternal(payload.media);
-        }
-
-        let finalMediaPath = mediaPath;
-        let finalMediaMime = payload.media?.mimetype || null;
-
-        // Custom logic: If document message starts with "Berikut tagihan untuk pesanan kakak",
-        // Extract invoice ID (INVxxx) and store it in media_path / media_mime = transaction.
-        if (
-          message.type === "document" &&
-          message.body &&
-          message.body.startsWith("Berikut tagihan untuk pesanan kakak")
-        ) {
-          const invMatch = message.body.match(/INV[0-9A-Z]+/);
-          if (invMatch) {
-            finalMediaPath = invMatch[0];
-            finalMediaMime = "transaction";
-          }
-        }
-
-        const { chat, message: savedMessage } = await upsertChatAndMessage({
-          sessionId,
-          phone,
-          jid: to,
-          chatJid: to,
-          text: message.body,
-          direction: "out",
-          fromMe: true,
-          messageType: message.type,
-          externalId: message.id.id,
-          timestamp: message.timestamp,
-          id_toko,
-          tenant_id,
-          mediaPath: finalMediaPath,
-          mediaMime: finalMediaMime,
-        });
-        const updatedChat = await broadcastMessage(savedMessage, chat);
-        broadcastChatUpdate(updatedChat || chat);
-      } catch (err) {
-        console.error(`[${sessionId}] DB persist error:`, err.message);
-      }
 
       try {
         logWebhookPayload(sessionId, payload);
@@ -1105,16 +559,6 @@ function startSession(sessionId, webhookUrl = null) {
         status: ACK_STATUS[ack] || "unknown",
         timestamp: message.timestamp,
       };
-
-      try {
-        const updatedMsg = await updateMessageStatus(
-          message.id.id,
-          ACK_STATUS[ack] || "unknown",
-        );
-        broadcastMessageStatus(updatedMsg);
-      } catch (err) {
-        console.error(`[${sessionId}] DB ack update error:`, err.message);
-      }
 
       try {
         logWebhookPayload(sessionId, payload);
@@ -1392,115 +836,7 @@ app.post("/api/session/read", async (req, res) => {
   }
 });
 
-const server = http.createServer(app);
-
-wss = new WebSocket.Server({ noServer: true });
-
-wss.on("connection", (ws, req) => {
-  ws.meta = {};
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const qs = Object.fromEntries(url.searchParams.entries());
-
-  // Info awal (bisa diisi token auth sendiri, contohnya dari qs.auth)
-  ws.send(JSON.stringify({ event: "ws_connected", info: { query: qs } }));
-
-  ws.on("message", async (raw) => {
-    let payload;
-    try {
-      payload = JSON.parse(raw);
-    } catch {
-      ws.send(JSON.stringify({ event: "error", message: "Invalid JSON" }));
-      return;
-    }
-
-    const action = payload.action;
-    if (action === "join") {
-      if (!payload.room) {
-        ws.send(JSON.stringify({ event: "error", message: "room missing" }));
-        return;
-      }
-      const channel = payload.channel || null; // default null = room utama
-      joinRoom(ws, payload.room, channel);
-      ws.send(JSON.stringify({ event: "joined", room: payload.room, channel }));
-      return;
-    }
-
-    if (action === "leave") {
-      if (!payload.room) {
-        ws.send(JSON.stringify({ event: "error", message: "room missing" }));
-        return;
-      }
-      const channel = payload.channel || null;
-      leaveRoom(ws, payload.room, channel);
-      ws.send(JSON.stringify({ event: "left", room: payload.room, channel }));
-      return;
-    }
-
-    if (action === "message") {
-      if (!payload.room || !payload.data) {
-        ws.send(
-          JSON.stringify({ event: "error", message: "room/data missing" }),
-        );
-        return;
-      }
-      const channel = payload.channel || null;
-      const fullRoom = channel ? `${payload.room}-${channel}` : payload.room;
-      broadcastRoom(
-        fullRoom,
-        { event: "message", room: payload.room, channel, data: payload.data },
-        ws,
-      );
-      return;
-    }
-
-    if (action === "join_list") {
-      ws.meta.sessionId = payload.sessionId || null;
-      ws.meta.id_toko =
-        payload.id_toko === undefined || payload.id_toko === null
-          ? null
-          : Number(payload.id_toko);
-      await sendChatList(ws);
-      return;
-    }
-
-    if (action === "join_chat") {
-      if (!payload.chatId) {
-        ws.send(JSON.stringify({ event: "error", message: "chatId missing" }));
-        return;
-      }
-      ws.meta.chatId = Number(payload.chatId);
-      await sendChatDetail(ws, ws.meta.chatId);
-      return;
-    }
-
-    ws.send(JSON.stringify({ event: "error", message: "unsupported action" }));
-  });
-
-  ws.on("close", () => {
-    leaveAllRooms(ws);
-  });
-});
-
-server.on("upgrade", (req, socket, head) => {
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    wss.emit("connection", ws, req);
-  });
-});
-
-app.post("/api/ws/room/:room/broadcast", (req, res) => {
-  const { room } = req.params;
-  const { event = "message", data, channel, chat_id } = req.body;
-  if (!room || data === undefined) {
-    return res.status(400).json({ error: "Missing: room, data" });
-  }
-  const fullRoom = channel ? `${room}-${channel}` : room;
-  const payload = { event, room, channel, data };
-  if (chat_id) payload.chat_id = chat_id;
-  broadcastRoom(fullRoom, payload);
-  res.json({ success: true, room, channel, event, data, chat_id });
-});
-
-server.listen(PORT, async () => {
+app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
   await restoreSessions();
 });
