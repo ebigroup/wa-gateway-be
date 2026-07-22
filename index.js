@@ -144,6 +144,17 @@ function logWebhookPayload(sessionId, payload) {
   );
 }
 
+// ── Kirim webhook dengan header standar ───────────────────────────────────────
+async function sendWebhook(url, payload) {
+  return axios.post(url, payload, {
+    headers: {
+      "Content-Type": "application/json",
+      "X-Timezone": "Asia/Jakarta",
+    },
+    timeout: 10000,
+  });
+}
+
 function formatTimestamp(ts) {
   if (!ts) return null;
   const ms = ts < 2_000_000_000 ? ts * 1000 : ts;
@@ -313,7 +324,7 @@ function startSession(sessionId, webhookUrl = null) {
         };
         try {
           logWebhookPayload(sessionId, payload);
-          await axios.post(url, payload);
+          await sendWebhook(url, payload);
         } catch (err) {
           console.error(`[${sessionId}] Webhook (connected) failed:`, err.message);
         }
@@ -431,7 +442,7 @@ function startSession(sessionId, webhookUrl = null) {
 
       try {
         logWebhookPayload(sessionId, payload);
-        if (url) await axios.post(url, payload);
+        if (url) await sendWebhook(url, payload);
       } catch (err) {
         console.error(`[${sessionId}] Webhook failed:`, err.message);
       }
@@ -526,7 +537,7 @@ function startSession(sessionId, webhookUrl = null) {
 
       try {
         logWebhookPayload(sessionId, payload);
-        if (url) await axios.post(url, payload);
+        if (url) await sendWebhook(url, payload);
       } catch (err) {
         console.error(`[${sessionId}] Webhook failed:`, err.message);
       }
@@ -572,7 +583,7 @@ function startSession(sessionId, webhookUrl = null) {
 
       try {
         logWebhookPayload(sessionId, payload);
-        if (url) await axios.post(url, payload);
+        if (url) await sendWebhook(url, payload);
       } catch (err) {
         console.error(`[${sessionId}] Webhook failed:`, err.message);
       }
